@@ -2077,3 +2077,166 @@ def test_get_pnl_today_includes_unrealized_marks(monkeypatch, tmp_path: Path) ->
     body = response.json()
     assert body["unrealized_pnl"] == "50.00000000"
     assert body["total_pnl"] == "50.00000000"
+
+# -- Phase 10 debt fixes -----------------------------------------------------
+
+
+def test_from_nl_live_requires_unlock_token(monkeypatch, tmp_path: Path) -> None:
+    """NL endpoint must forward x-live-unlock to create_intent (Phase 9 BUG-1)."""
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(orchestrator_app, "CLAUDE_API_KEY", "test-key")
+    monkeypatch.setattr(orchestrator_app, "OPS_TOKEN", "ops")
+
+    client = TestClient(orchestrator_app.app)
+    issued = client.post(
+        "/admin/live-unlock", json={"actor": "user_1"}, headers={"x-ops-token": "ops"}
+    ).json()
+    token = issued["token"]
+
+    def fake_post(url: str, **kwargs: object) -> FakeResponse:
+        if "anthropic" in url:
+            return FakeResponse(claude_response())
+        if url.endswith("/validate"):
+            return FakeResponse(decision())
+        return FakeResponse(execution())
+
+    monkeypatch.setattr(orchestrator_app.httpx, "post", fake_post)
+    payload = {
+        "actor": "user_1",
+        "message": "buy 100 USDT of BTC at market",
+        "idempotency_key": "nl-live-001",
+        "mode": "live",
+    }
+
+    no_tok = client.post("/intents/from_nl", json=payload)
+    assert no_tok.status_code == 403
+    assert no_tok.json()["code"] == "LIVE_UNLOCK_REQUIRED"
+
+    with_tok = client.post(
+        "/intents/from_nl", json=payload, headers={"x-live-unlock": token}
+    )
+    assert with_tok.status_code == 200
+
+
+def test_from_scorecard_consume_is_conditional_update(monkeypatch, tmp_path: Path) -> None:
+    """Steady-state consumed scorecards are rejected; final consume uses rowcount."""
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        orchestrator_app.httpx,
+        "post",
+        lambda url, **k: (
+            FakeResponse(decision())
+            if url.endswith("/validate")
+            else FakeResponse(execution())
+        ),
+    )
+    monkeypatch.setattr(orchestrator_app.httpx, "get", lambda *a, **k: FakePriceResponse())
+
+    client = TestClient(orchestrator_app.app)
+    scorecard = client.post("/scorecards", json=make_scorecard_payload()).json()
+    scorecard_id = scorecard["scorecard_id"]
+
+    first = client.post(
+        "/intents/from_scorecard",
+        json={
+            "scorecard_id": scorecard_id,
+            "actor": "user_1",
+            "idempotency_key": "first",
+            "usdt_budget": "200",
+        },
+    )
+    assert first.status_code == 200
+
+    second = client.post(
+        "/intents/from_scorecard",
+        json={
+            "scorecard_id": scorecard_id,
+            "actor": "user_1",
+            "idempotency_key": "second",
+            "usdt_budget": "200",
+        },
+    )
+    assert second.status_code == 409
+    assert second.json()["code"] == "SCORECARD_ALREADY_CONSUMED"
+
+
+def test_scorecard_race_rowcount_returns_409(monkeypatch, tmp_path: Path) -> None:
+    """BUG-2 deterministic seam: final conditional UPDATE rowcount=0 returns SCORECARD_RACED."""
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        orchestrator_app.httpx,
+        "post",
+        lambda url, **k: (
+            FakeResponse(decision())
+            if url.endswith("/validate")
+            else FakeResponse(execution())
+        ),
+    )
+    client = TestClient(orchestrator_app.app)
+    scorecard_id = client.post("/scorecards", json=make_scorecard_payload()).json()["scorecard_id"]
+    original_should_mark = orchestrator_app._scorecard_should_mark_consumed
+
+    def race_after_response(response: object) -> bool:
+        result = original_should_mark(response)
+        with orchestrator_app.connect() as conn:
+            conn.execute(
+                "update scorecards set consumed_by_intent_id = ? where scorecard_id = ?",
+                ("concurrent-winner", scorecard_id),
+            )
+            conn.commit()
+        return result
+
+    monkeypatch.setattr(orchestrator_app, "_scorecard_should_mark_consumed", race_after_response)
+    response = client.post(
+        "/intents/from_scorecard",
+        json={
+            "scorecard_id": scorecard_id,
+            "actor": "user_1",
+            "idempotency_key": "raced",
+            "usdt_budget": "200",
+        },
+    )
+    assert response.status_code == 409
+    assert response.json()["code"] == "SCORECARD_RACED"
+    assert "your_intent_id" in response.json()
+
+
+def test_live_unlock_wet_rowcount_zero_returns_used(monkeypatch, tmp_path: Path) -> None:
+    """BUG-3: dry=False must treat conditional UPDATE rowcount=0 as already used."""
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(orchestrator_app, "OPS_TOKEN", "ops")
+    client = TestClient(orchestrator_app.app)
+    issued = client.post(
+        "/admin/live-unlock", json={"actor": "user_1"}, headers={"x-ops-token": "ops"}
+    ).json()
+    token = issued["token"]
+
+    calls = {"n": 0}
+    original_connect = orchestrator_app.connect
+
+    class RaceCursor:
+        rowcount = 0
+
+    class RaceConn:
+        def __enter__(self) -> "RaceConn":
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        def execute(self, sql: str, params: object = ()) -> object:
+            if sql.startswith("select actor"):
+                calls["n"] += 1
+                with original_connect() as conn:
+                    return conn.execute(sql, params)
+            return RaceCursor()
+
+        def commit(self) -> None:
+            return None
+
+    monkeypatch.setattr(orchestrator_app, "connect", lambda: RaceConn())
+    err = orchestrator_app._consume_live_unlock_or_error(token, "user_1", dry=False)
+    assert err is not None
+    body = json.loads(bytes(err.body).decode())
+    assert body["code"] == "LIVE_UNLOCK_ALREADY_USED"
+

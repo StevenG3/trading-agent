@@ -202,3 +202,21 @@ curl -s 'http://127.0.0.1:8080/pnl/today?actor=user_1'
 ```
 
 Live trading still supports Binance Spot only. IBKR, equities, futures, margin, and leverage are deliberately deferred.
+
+## Phase 10: TradingAgents analysis adapter
+
+The `analysis-adapter` service is the HTTP seam between the external TradingAgents deployment in `/home/gggqqy/apps/tradingagents-official/` and this platform's scorecard layer. It never imports TradingAgents modules and never talks to execution-service; it calls the TradingAgents bridge over HTTP, translates the result into a scorecard, then posts that scorecard to orchestrator.
+
+Start a TA-driven analysis with:
+
+```bash
+curl -X POST http://localhost:8085/analyze \
+  -H "content-type: application/json" \
+  -d '{"actor":"user_1","symbol":"BTCUSDT","asset_type":"crypto"}'
+```
+
+The request returns immediately with `{"job_id":"...","status":"queued"}`. Poll `GET /jobs/{job_id}` until `status="succeeded"`; the resulting `scorecard_id` can then be consumed through orchestrator's existing `/intents/from_scorecard` path. Live order creation still requires `LIVE_TRADING_ENABLED` plus a valid single-use `x-live-unlock` token.
+
+TradingAgents analysts are originally equity-focused. Crypto support depends on TradingAgents' own dataflows; this adapter does not compensate for missing crypto-native data sources, so treat crypto reports with appropriate skepticism until upstream data sources improve.
+
+The conviction heuristic is intentionally simple: hold maps to `0.30`; buy/sell starts at `0.50` and adds `0.10` for each populated analyst report, capped at `0.90`. Future phases can refine this from TA debate margins and historical hit rate.

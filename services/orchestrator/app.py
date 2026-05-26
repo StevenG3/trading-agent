@@ -484,12 +484,16 @@ def _consume_live_unlock_or_error(token: str, actor: str, dry: bool) -> JSONResp
         return JSONResponse(status_code=410, content={"code": "LIVE_UNLOCK_EXPIRED"})
     if not dry:
         with connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 "update live_unlock_tokens set consumed_at = ? "
                 "where token = ? and consumed_at is NULL",
                 (now_iso, token),
             )
             conn.commit()
+        if cursor.rowcount == 0:
+            return JSONResponse(
+                status_code=403, content={"code": "LIVE_UNLOCK_ALREADY_USED"}
+            )
     return None
 
 
@@ -745,7 +749,10 @@ def get_pnl_today(actor: str | None = None) -> JSONResponse | dict[str, object]:
 
 
 @app.post("/intents/from_nl", response_model=None)
-def create_intent_from_nl(nl: NLIntentRequest) -> JSONResponse | dict[str, object]:
+def create_intent_from_nl(
+    nl: NLIntentRequest,
+    x_live_unlock: str = Header(default=""),
+) -> JSONResponse | dict[str, object]:
     if not CLAUDE_API_KEY:
         return JSONResponse(
             status_code=503,
@@ -777,7 +784,7 @@ def create_intent_from_nl(nl: NLIntentRequest) -> JSONResponse | dict[str, objec
             content={"code": "HERMES_PARSE_ERROR", "detail": str(exc)[:300]},
         )
 
-    return create_intent(intent, x_live_unlock="")
+    return create_intent(intent, x_live_unlock=x_live_unlock)
 
 
 @app.post("/intents/from_scorecard", response_model=None)
@@ -887,11 +894,21 @@ def create_intent_from_scorecard(
     response = create_intent(intent, x_live_unlock=x_live_unlock)
     if _scorecard_should_mark_consumed(response):
         with connect() as conn:
-            conn.execute(
-                "update scorecards set consumed_by_intent_id = ? where scorecard_id = ?",
+            cursor = conn.execute(
+                "update scorecards set consumed_by_intent_id = ? "
+                "where scorecard_id = ? and consumed_by_intent_id is NULL",
                 (str(intent.intent_id), str(scorecard.scorecard_id)),
             )
             conn.commit()
+        if cursor.rowcount == 0:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "code": "SCORECARD_RACED",
+                    "detail": "scorecard was consumed by a concurrent request",
+                    "your_intent_id": str(intent.intent_id),
+                },
+            )
     return response
 
 

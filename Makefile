@@ -10,7 +10,7 @@ lint:
 	$(DOCKER_RUN) "pip install -q -e .[dev] && ruff check ."
 
 typecheck:
-	$(DOCKER_RUN) "pip install -q -e .[dev] && mypy --strict packages && mypy --strict services/orchestrator/app.py services/orchestrator/db.py && mypy --strict services/risk-engine/app.py && mypy --strict services/execution-service/app.py services/execution-service/db.py && mypy --strict services/market-data/app.py"
+	$(DOCKER_RUN) "pip install -q -e .[dev] && mypy --strict packages && mypy --strict services/orchestrator/app.py services/orchestrator/db.py && mypy --strict services/risk-engine/app.py && mypy --strict services/execution-service/app.py services/execution-service/db.py && mypy --strict services/market-data/app.py && mypy --strict services/analysis-adapter/app.py services/analysis-adapter/db.py"
 
 verify:
-	$(DOCKER_RUN) "pip install -q -e .[dev] && ruff check . && mypy --strict packages && mypy --strict services/orchestrator/app.py services/orchestrator/db.py && mypy --strict services/risk-engine/app.py && mypy --strict services/execution-service/app.py services/execution-service/db.py && mypy --strict services/market-data/app.py && pytest -q"
+	$(DOCKER_RUN) "pip install -q -e .[dev] && ruff check . && mypy --strict packages && mypy --strict services/orchestrator/app.py services/orchestrator/db.py && mypy --strict services/risk-engine/app.py && mypy --strict services/execution-service/app.py services/execution-service/db.py && mypy --strict services/market-data/app.py && mypy --strict services/analysis-adapter/app.py services/analysis-adapter/db.py && pytest -q"

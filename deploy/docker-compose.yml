@@ -92,6 +92,29 @@ services:
       timeout: 3s
       retries: 5
 
+  analysis-adapter:
+    build:
+      context: ..
+      dockerfile: services/analysis-adapter/Dockerfile
+    environment:
+      DATA_DIR: /data
+      ORCHESTRATOR_URL: http://orchestrator:8080
+      TA_BRIDGE_URL: ${TA_BRIDGE_URL:-http://tradingagents-bridge:18181}
+      TA_DEFAULT_PROVIDER: ${TA_DEFAULT_PROVIDER:-deepseek}
+      TA_TIMEOUT_SEC: ${TA_TIMEOUT_SEC:-900}
+      ANALYSIS_SCORECARD_TTL_MIN: ${ANALYSIS_SCORECARD_TTL_MIN:-60}
+    volumes:
+      - trading_data:/data
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    networks: [trading_net]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8085/healthz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
 volumes:
   trading_data:
 
