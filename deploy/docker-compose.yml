@@ -15,7 +15,7 @@ services:
       LIVE_UNLOCK_TTL_MIN: "15"
       SCORECARD_DEFAULT_TTL_MIN: "60"
     ports:
-      - "8080:8080"
+      - "127.0.0.1:${ORCHESTRATOR_HOST_PORT:-18081}:8080"
     volumes:
       - trading_data:/data
     depends_on:
@@ -25,7 +25,7 @@ services:
         condition: service_healthy
       market-data:
         condition: service_healthy
-    networks: [trading_net]
+    networks: [trading_net, host_access_net]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz')"]
       interval: 10s
@@ -103,12 +103,14 @@ services:
       TA_DEFAULT_PROVIDER: ${TA_DEFAULT_PROVIDER:-deepseek}
       TA_TIMEOUT_SEC: ${TA_TIMEOUT_SEC:-900}
       ANALYSIS_SCORECARD_TTL_MIN: ${ANALYSIS_SCORECARD_TTL_MIN:-60}
+    ports:
+      - "127.0.0.1:${ANALYSIS_ADAPTER_HOST_PORT:-18085}:8085"
     volumes:
       - trading_data:/data
     depends_on:
       orchestrator:
         condition: service_healthy
-    networks: [trading_net]
+    networks: [trading_net, host_access_net]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8085/healthz')"]
       interval: 10s
@@ -121,3 +123,4 @@ volumes:
 networks:
   trading_net:
     internal: true
+  host_access_net: {}
