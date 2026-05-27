@@ -46,6 +46,32 @@ CRYPTO_NAME_TO_SYMBOL = {
 QUOTE_ASSETS = ("USDT", "USDC", "USD", "BUSD")
 
 
+RESEARCH_RATING_TO_DECISION = {
+    "STRONG BUY": "BUY",
+    "OUTPERFORM": "BUY",
+    "OVERWEIGHT": "BUY",
+    "ACCUMULATE": "BUY",
+    "BUY": "BUY",
+    "MARKET WEIGHT": "HOLD",
+    "EQUAL WEIGHT": "HOLD",
+    "NEUTRAL": "HOLD",
+    "HOLD": "HOLD",
+    "REDUCE": "SELL",
+    "UNDERWEIGHT": "SELL",
+    "UNDERPERFORM": "SELL",
+    "SELL": "SELL",
+    "STRONG SELL": "SELL",
+}
+
+
+def _decision_from_research_rating(value: str) -> str | None:
+    normalized = re.sub(r"[^A-Z ]", " ", value.upper())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    for rating, decision in RESEARCH_RATING_TO_DECISION.items():
+        if re.search(rf"\b{re.escape(rating)}\b", normalized):
+            return decision
+    return None
+
 def _normalize_ta_ticker(symbol: str, asset_type: str) -> str:
     """Convert user/trading crypto symbols to TradingAgents-friendly tickers."""
     cleaned = symbol.strip()
@@ -266,10 +292,16 @@ def _stub_ta_response(req: AnalyzeRequest) -> dict[str, object]:
 def _translate_to_scorecard_payload(
     req: AnalyzeRequest, raw: dict[str, object]
 ) -> dict[str, object]:
-    decision = str(raw.get("decision", "")).strip().upper()
+    decision_text = str(raw.get("decision", ""))
+    decision = decision_text.strip().upper()
+    if decision not in {"BUY", "HOLD", "SELL"}:
+        decision = _decision_from_research_rating(decision_text) or ""
     if decision not in {"BUY", "HOLD", "SELL"}:
         final_text = str(raw.get("final_trade_decision", ""))
+        decision = _decision_from_research_rating(final_text) or ""
         for token in ("BUY", "SELL", "HOLD"):
+            if decision:
+                break
             if f"**{token}**" in final_text.upper():
                 decision = token
                 break

@@ -106,6 +106,49 @@ def test_analyze_propagates_ta_decision_to_action(monkeypatch, tmp_path: Path) -
 
 
 
+
+def test_analyze_maps_research_rating_underweight_to_sell(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    posted: dict[str, object] = {}
+
+    def fake_post(url: str, **kwargs: object) -> FakeResponse:
+        if url.endswith("/analyze"):
+            return FakeResponse({
+                "ok": True,
+                "decision": "Underweight",
+                "provider": "deepseek",
+                "final_trade_decision": "**Rating**: Underweight\nReduce BTC exposure by 20%.",
+                "reports": {"market": "weak momentum", "news": "ETF outflows"},
+            })
+        if url.endswith("/scorecards"):
+            posted.update(kwargs.get("json") or {})
+            return FakeResponse({"scorecard_id": str(uuid4())})
+        raise AssertionError(url)
+
+    monkeypatch.setattr(adapter_app.httpx, "post", fake_post)
+    job_id = TestClient(adapter_app.app).post(
+        "/analyze", json={"actor": "u", "symbol": "BTCUSDT"}
+    ).json()["job_id"]
+    _await_job(job_id, status="succeeded")
+
+    assert posted["action"] == "sell"
+    assert posted["metadata"]["ta_decision"] == "SELL"
+
+
+def test_analyze_maps_research_rating_overweight_and_neutral() -> None:
+    req = adapter_app.AnalyzeRequest(actor="u", symbol="BTCUSDT")
+    overweight = adapter_app._translate_to_scorecard_payload(
+        req, {"ok": True, "decision": "Overweight", "reports": {}}
+    )
+    neutral = adapter_app._translate_to_scorecard_payload(
+        req, {"ok": True, "decision": "Market Weight", "reports": {}}
+    )
+
+    assert overweight["action"] == "buy"
+    assert neutral["action"] == "hold"
+
 def test_crypto_symbol_normalization_sent_to_tradingagents_bridge(
     monkeypatch, tmp_path: Path
 ) -> None:
