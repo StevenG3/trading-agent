@@ -167,6 +167,15 @@ def init_db(conn: sqlite3.Connection) -> None:
         "create index if not exists idx_scorecard_outcomes_scorecard "
         "on scorecard_outcomes(scorecard_id)"
     )
+    try:
+        conn.execute("alter table scorecard_outcomes add column reflected_at text")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    conn.execute(
+        "create index if not exists idx_scorecard_outcomes_reflection "
+        "on scorecard_outcomes(status, reflected_at)"
+    )
     conn.execute(
         "create index if not exists idx_scorecard_outcomes_source "
         "on scorecard_outcomes(source, status)"

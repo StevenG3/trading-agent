@@ -333,3 +333,68 @@ def test_analyze_orchestrator_failure_marks_job_failed(monkeypatch, tmp_path: Pa
         "/analyze", json={"actor": "u", "symbol": "BTCUSDT", "dry_run": True}
     ).json()["job_id"]
     _await_job(job_id, status="failed")
+
+
+def test_scorecard_metadata_includes_ta_date_and_exact_ticker_sent_to_bridge(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    posted: dict[str, object] = {}
+    seen_ticker: list[str] = []
+
+    def fake_post(url: str, **kwargs: object) -> FakeResponse:
+        if url.endswith("/analyze"):
+            payload = kwargs.get("json") or {}
+            assert isinstance(payload, dict)
+            seen_ticker.append(str(payload["ticker"]))
+            return FakeResponse({
+                "ok": True,
+                "ticker": payload["ticker"],
+                "date": payload["date"],
+                "decision": "BUY",
+                "provider": "deepseek",
+                "reports": {"market": "up", "news": "calm"},
+            })
+        if url.endswith("/scorecards"):
+            posted.update(kwargs.get("json") or {})
+            return FakeResponse({"scorecard_id": str(uuid4())})
+        raise AssertionError(url)
+
+    monkeypatch.setattr(adapter_app.httpx, "post", fake_post)
+    job_id = TestClient(adapter_app.app).post(
+        "/analyze", json={"actor": "u", "symbol": "BTCUSDT"}
+    ).json()["job_id"]
+    _await_job(job_id, status="succeeded")
+
+    assert seen_ticker == ["BTC-USD"]
+    assert posted["symbol"] == "BTCUSDT"
+    assert posted["metadata"]["ta_ticker"] == "BTC-USD"
+    assert posted["metadata"]["ta_date"]
+
+
+def test_reflect_outcome_endpoint_posts_to_bridge(monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_post(url: str, **kwargs: object) -> FakeResponse:
+        assert url.endswith("/reflect")
+        seen.update(kwargs.get("json") or {})
+        return FakeResponse({"ok": True, "reflected": True})
+
+    monkeypatch.setattr(adapter_app.httpx, "post", fake_post)
+    response = TestClient(adapter_app.app).post(
+        "/reflect/outcome",
+        json={
+            "ticker": "BTC-USD",
+            "trade_date": "2026-05-01",
+            "raw_return": "0.1200",
+            "alpha_return": "0.0500",
+            "holding_days": 7,
+            "provider": "deepseek",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["reflected"] is True
+    assert seen["ticker"] == "BTC-USD"
+    assert seen["date"] == "2026-05-01"
+    assert seen["raw_return"] == 0.12

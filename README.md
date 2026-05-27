@@ -234,3 +234,8 @@ curl 'http://localhost:8080/scorecard-outcomes?actor=user_1&status=closed'
 curl 'http://localhost:8080/scorecard-outcomes/summary?actor=user_1'
 curl 'http://localhost:8080/scorecard-outcomes/11111111-1111-4111-8111-111111111111'
 ```
+
+
+### Outcome reflection
+
+Closed scorecard outcomes are pushed back through the analysis adapter to the TradingAgents bridge so future analyses can learn from paper-trading results. If the bridge is unavailable, `reflected_at` stays empty and operators can retry with `POST /reflect/pending?limit=50`. The outcomes summary includes `pending_reflection_count` per source.

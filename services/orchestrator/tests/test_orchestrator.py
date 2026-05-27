@@ -2565,3 +2565,102 @@ def test_outcome_for_scorecard_deleted_from_table_uses_unknown_source(
 
     item = client.get("/scorecard-outcomes").json()["items"][0]
     assert item["source"] == "unknown"
+
+
+def test_outcome_close_pushes_reflection_and_sets_reflected_at(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    _risk_and_execution(monkeypatch, avg_price="100000.00", filled_qty="0.001")
+    reflection_calls: list[dict[str, object]] = []
+
+    def fake_push(outcome: dict[str, object]) -> bool:
+        reflection_calls.append(outcome)
+        return True
+
+    monkeypatch.setattr(orchestrator_app, "_push_outcome_reflection", fake_push)
+    client = TestClient(orchestrator_app.app)
+    _create_scorecard_order(client, idempotency_key="reflect-close-buy")
+    _manual_sell(client, idempotency_key="reflect-close-sell", qty="0.001", price="110000.00")
+
+    item = client.get("/scorecard-outcomes", params={"status": "closed"}).json()["items"][0]
+    assert item["reflected_at"] is not None
+    assert reflection_calls[0]["symbol"] == "BTCUSDT"
+    assert reflection_calls[0]["closed_return_pct"] == "0.10000000"
+
+
+def test_outcome_reflection_failure_leaves_reflected_at_null(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    _risk_and_execution(monkeypatch, avg_price="100000.00", filled_qty="0.001")
+    monkeypatch.setattr(orchestrator_app, "_push_outcome_reflection", lambda outcome: False)
+    client = TestClient(orchestrator_app.app)
+    _create_scorecard_order(client, idempotency_key="reflect-fail-buy")
+    _manual_sell(client, idempotency_key="reflect-fail-sell", qty="0.001", price="110000.00")
+
+    item = client.get("/scorecard-outcomes", params={"status": "closed"}).json()["items"][0]
+    assert item["reflected_at"] is None
+
+
+def test_reflect_pending_endpoint_retries_closed_unreflected(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    calls: list[dict[str, object]] = []
+    now = orchestrator_app._now().isoformat()
+    with orchestrator_app.connect() as conn:
+        conn.execute(
+            "insert into scorecard_outcomes "
+            "(outcome_id, scorecard_id, actor, symbol, source, action, opened_intent_id, "
+            "opened_at, opened_qty, opened_avg_cost, opened_cost_basis, status, "
+            "closed_at, closed_realized_pnl, closed_return_pct, notes, reflected_at) "
+            "values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)",
+            (
+                str(orchestrator_app.uuid4()), "sc-rp", "user_1", "BTCUSDT",
+                "tradingagents", "buy", "intent-rp", now, "0.00100000",
+                "100000.00000000", "100.00000000", "closed", now, "10.00000000",
+                "0.10000000", None,
+            ),
+        )
+        conn.commit()
+
+    def fake_push(outcome: dict[str, object]) -> bool:
+        calls.append(outcome)
+        return True
+
+    monkeypatch.setattr(orchestrator_app, "_push_outcome_reflection", fake_push)
+    response = TestClient(orchestrator_app.app).post("/reflect/pending", params={"limit": 25})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["attempted"] == 1
+    assert body["reflected"] == 1
+    assert body["failed"] == 0
+    assert calls[0]["scorecard_id"] == "sc-rp"
+    item = (
+        TestClient(orchestrator_app.app)
+        .get("/scorecard-outcomes", params={"status": "closed"})
+        .json()["items"][0]
+    )
+    assert item["reflected_at"] is not None
+
+
+def test_outcomes_summary_includes_pending_reflection_count(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    now = orchestrator_app._now().isoformat()
+    with orchestrator_app.connect() as conn:
+        for i, reflected in enumerate([None, now]):
+            conn.execute(
+                "insert into scorecard_outcomes "
+                "(outcome_id, scorecard_id, actor, symbol, source, action, opened_intent_id, "
+                "opened_at, opened_qty, opened_avg_cost, opened_cost_basis, status, "
+                "closed_at, closed_realized_pnl, closed_return_pct, notes, reflected_at) "
+                "values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    str(orchestrator_app.uuid4()), f"sc-pr-{i}", "user_1", "BTCUSDT",
+                    "tradingagents", "buy", f"intent-pr-{i}", now, "0.00100000",
+                    "100000.00000000", "100.00000000", "closed", now, "5.00000000",
+                    "0.05000000", None, reflected,
+                ),
+            )
+        conn.commit()
+
+    stats = TestClient(orchestrator_app.app).get(
+        "/scorecard-outcomes/summary", params={"actor": "user_1"}
+    ).json()["by_source"]["tradingagents"]
+    assert stats["pending_reflection_count"] == 1

@@ -47,6 +47,8 @@ CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 SCORECARD_DEFAULT_TTL_MIN = int(os.getenv("SCORECARD_DEFAULT_TTL_MIN", "60"))
 OPS_TOKEN = os.getenv("OPS_TOKEN", "")
 LIVE_UNLOCK_TTL_MIN = int(os.getenv("LIVE_UNLOCK_TTL_MIN", "15"))
+ANALYSIS_ADAPTER_URL = os.getenv("ANALYSIS_ADAPTER_URL", "http://analysis-adapter:8085")
+REFLECT_TIMEOUT_SEC = float(os.getenv("REFLECT_TIMEOUT_SEC", "60"))
 
 _HERMES_SYSTEM_PROMPT = """\
 You are an order intent parser for a cryptocurrency spot trading platform (Binance Spot only).
@@ -390,6 +392,7 @@ def _maybe_close_scorecard_outcomes(
     total_basis = sum(Decimal(row["opened_cost_basis"]) for row in rows) or Decimal("1")
     closed_at = _now().isoformat()
     notes = "split-attribution" if len(rows) > 1 else None
+    closed_ids: list[str] = []
     with connect() as conn:
         for row in rows:
             basis = Decimal(row["opened_cost_basis"])
@@ -402,6 +405,86 @@ def _maybe_close_scorecard_outcomes(
                 "notes = ? where outcome_id = ?",
                 (closed_at, _q8s(attributed), _q8s(return_pct), notes, row["outcome_id"]),
             )
+            closed_ids.append(str(row["outcome_id"]))
+        conn.commit()
+
+    for outcome_id in closed_ids:
+        outcome = _load_outcome_for_reflection(outcome_id)
+        if outcome and _push_outcome_reflection(outcome):
+            _mark_outcome_reflected(outcome_id)
+
+
+def _load_outcome_for_reflection(outcome_id: str) -> dict[str, object] | None:
+    with connect() as conn:
+        row = conn.execute(
+            "select outcome_id, scorecard_id, actor, symbol, source, action, "
+            "opened_intent_id, opened_at, opened_qty, opened_avg_cost, "
+            "opened_cost_basis, status, closed_at, closed_realized_pnl, "
+            "closed_return_pct, notes, reflected_at from scorecard_outcomes where outcome_id = ?",
+            (outcome_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return _outcome_row_to_dict(row)
+
+
+def _scorecard_metadata(scorecard_id: str) -> dict[str, str]:
+    with connect() as conn:
+        row = conn.execute(
+            "select payload_json from scorecards where scorecard_id = ?", (scorecard_id,)
+        ).fetchone()
+    if row is None:
+        return {}
+    try:
+        payload = json.loads(str(row["payload_json"]))
+    except json.JSONDecodeError:
+        return {}
+    metadata = payload.get("metadata") if isinstance(payload, dict) else None
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _holding_days(opened_at: str | None, closed_at: str | None) -> int:
+    try:
+        opened = datetime.fromisoformat(str(opened_at).replace("Z", "+00:00"))
+        closed = datetime.fromisoformat(str(closed_at).replace("Z", "+00:00"))
+    except ValueError:
+        return 0
+    return max(0, (closed.date() - opened.date()).days)
+
+
+def _push_outcome_reflection(outcome: dict[str, object]) -> bool:
+    metadata = _scorecard_metadata(str(outcome.get("scorecard_id", "")))
+    closed_return = str(outcome.get("closed_return_pct") or "0")
+    payload = {
+        "ticker": metadata.get("ta_ticker") or outcome.get("symbol"),
+        "trade_date": metadata.get("ta_date") or str(outcome.get("opened_at", ""))[:10],
+        "raw_return": closed_return,
+        "alpha_return": closed_return,
+        "holding_days": _holding_days(
+            str(outcome.get("opened_at") or ""), str(outcome.get("closed_at") or "")
+        ),
+        "provider": metadata.get("provider"),
+        "benchmark_name": "paper-position-baseline",
+    }
+    try:
+        response = httpx.post(
+            f"{ANALYSIS_ADAPTER_URL}/reflect/outcome",
+            json=payload,
+            timeout=REFLECT_TIMEOUT_SEC,
+        )
+        response.raise_for_status()
+        body = response.json()
+    except (httpx.HTTPError, ValueError):
+        return False
+    return bool(isinstance(body, dict) and body.get("ok") and body.get("reflected"))
+
+
+def _mark_outcome_reflected(outcome_id: str) -> None:
+    with connect() as conn:
+        conn.execute(
+            "update scorecard_outcomes set reflected_at = ? where outcome_id = ?",
+            (_now().isoformat(), outcome_id),
+        )
         conn.commit()
 
 def _update_position(execution: ExecutionResult, intent: OrderIntent) -> None:
@@ -826,7 +909,7 @@ def list_outcomes(
             select outcome_id, scorecard_id, actor, symbol, source, action,
                    opened_intent_id, opened_at, opened_qty, opened_avg_cost,
                    opened_cost_basis, status, closed_at, closed_realized_pnl,
-                   closed_return_pct, notes
+                   closed_return_pct, notes, reflected_at
             from scorecard_outcomes{where}
             order by opened_at desc
             limit ?
@@ -869,6 +952,19 @@ def outcomes_summary(actor: str | None = None, since: str | None = None) -> dict
             f"where {' and '.join(open_clauses)} group by source",
             open_params,
         ).fetchall()
+        pending_reflection_clauses = ["status = 'closed'", "reflected_at is null"]
+        pending_reflection_params: list[object] = []
+        if actor:
+            pending_reflection_clauses.append("actor = ?")
+            pending_reflection_params.append(actor)
+        if since:
+            pending_reflection_clauses.append("closed_at >= ?")
+            pending_reflection_params.append(since)
+        pending_reflection_rows = conn.execute(
+            f"select source, count(*) as n from scorecard_outcomes "
+            f"where {' and '.join(pending_reflection_clauses)} group by source",
+            pending_reflection_params,
+        ).fetchall()
 
     by_source: dict[str, _OutcomeSummaryBucket] = {}
     for row in closed_rows:
@@ -881,6 +977,11 @@ def outcomes_summary(actor: str | None = None, since: str | None = None) -> dict
             bucket.hits += 1
         elif pnl < 0:
             bucket.losses += 1
+
+    pending_reflections: dict[str, int] = {}
+    for row in pending_reflection_rows:
+        pending_reflections[str(row["source"])] = int(str(row["n"]))
+        by_source.setdefault(str(row["source"]), _OutcomeSummaryBucket())
 
     for row in open_rows:
         bucket = by_source.setdefault(str(row["source"]), _OutcomeSummaryBucket())
@@ -900,8 +1001,35 @@ def outcomes_summary(actor: str | None = None, since: str | None = None) -> dict
             ),
             "realized_pnl": _q8s(bucket.total_pnl),
             "total_pnl": _q8s(bucket.total_pnl),
+            "pending_reflection_count": pending_reflections.get(src, 0),
         }
     return {"actor": actor, "since": since, "by_source": summary}
+
+
+@app.post("/reflect/pending", response_model=None)
+def reflect_pending(limit: int = Query(default=50, ge=1, le=500)) -> dict[str, object]:
+    with connect() as conn:
+        rows = conn.execute(
+            "select outcome_id, scorecard_id, actor, symbol, source, action, "
+            "opened_intent_id, opened_at, opened_qty, opened_avg_cost, "
+            "opened_cost_basis, status, closed_at, closed_realized_pnl, "
+            "closed_return_pct, notes, reflected_at from scorecard_outcomes "
+            "where status = 'closed' and reflected_at is null "
+            "order by closed_at asc limit ?",
+            (limit,),
+        ).fetchall()
+    attempted = 0
+    reflected = 0
+    failed = 0
+    for row in rows:
+        attempted += 1
+        outcome = _outcome_row_to_dict(row)
+        if _push_outcome_reflection(outcome):
+            _mark_outcome_reflected(str(outcome["outcome_id"]))
+            reflected += 1
+        else:
+            failed += 1
+    return {"attempted": attempted, "reflected": reflected, "failed": failed}
 
 
 @app.get("/scorecard-outcomes/{outcome_id}", response_model=None)
@@ -911,7 +1039,7 @@ def get_outcome(outcome_id: UUID) -> JSONResponse | dict[str, object]:
             "select outcome_id, scorecard_id, actor, symbol, source, action, "
             "opened_intent_id, opened_at, opened_qty, opened_avg_cost, "
             "opened_cost_basis, status, closed_at, closed_realized_pnl, "
-            "closed_return_pct, notes from scorecard_outcomes where outcome_id = ?",
+            "closed_return_pct, notes, reflected_at from scorecard_outcomes where outcome_id = ?",
             (str(outcome_id),),
         ).fetchone()
     if row is None:
@@ -937,6 +1065,7 @@ def _outcome_row_to_dict(row: sqlite3.Row) -> dict[str, object]:
         "closed_realized_pnl": row["closed_realized_pnl"],
         "closed_return_pct": row["closed_return_pct"],
         "notes": row["notes"],
+        "reflected_at": row["reflected_at"],
     }
 
 

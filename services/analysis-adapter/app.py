@@ -122,6 +122,18 @@ class AnalyzeRequest(BaseModel):
     dry_run: bool = False
 
 
+class ReflectOutcomeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ticker: str = Field(min_length=1)
+    trade_date: str = Field(min_length=10, max_length=10)
+    raw_return: str | float
+    alpha_return: str | float
+    holding_days: int = Field(ge=0)
+    provider: str | None = None
+    benchmark_name: str | None = None
+
+
 AnalyzeRequest.model_rebuild(_types_namespace={"Literal": Literal, "AnalystName": AnalystName})
 
 
@@ -171,6 +183,26 @@ def analyze(req: AnalyzeRequest) -> dict[str, object]:
     )
     worker.start()
     return {"job_id": job_id, "status": "queued", "requested_at": requested_at}
+
+
+@app.post("/reflect/outcome", response_model=None)
+def reflect_outcome(req: ReflectOutcomeRequest) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "ticker": req.ticker,
+        "date": req.trade_date,
+        "raw_return": float(req.raw_return),
+        "alpha_return": float(req.alpha_return),
+        "holding_days": req.holding_days,
+        "provider": req.provider or TA_DEFAULT_PROVIDER,
+    }
+    if req.benchmark_name:
+        payload["benchmark_name"] = req.benchmark_name
+    response = httpx.post(f"{TA_BRIDGE_URL}/reflect", json=payload, timeout=TA_TIMEOUT_SEC)
+    response.raise_for_status()
+    body = response.json()
+    if not isinstance(body, dict):
+        raise ValueError("TA bridge returned non-dict body")
+    return body
 
 
 @app.get("/jobs/{job_id}", response_model=None)
@@ -317,6 +349,10 @@ def _translate_to_scorecard_payload(
     metadata["ta_decision"] = decision
     metadata["asset_type"] = req.asset_type
     metadata["provider"] = str(raw.get("provider", req.provider or TA_DEFAULT_PROVIDER))
+    metadata["ta_date"] = str(raw.get("date") or _now().strftime("%Y-%m-%d"))
+    metadata["ta_ticker"] = str(
+        raw.get("ticker") or _normalize_ta_ticker(req.symbol, req.asset_type)
+    )
 
     thesis_parts: list[str] = []
     if isinstance(reports.get("market"), str):
