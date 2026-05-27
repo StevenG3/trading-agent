@@ -64,6 +64,23 @@ def _normalize_ta_ticker(symbol: str, asset_type: str) -> str:
     return f"{base}-USD"
 
 
+
+def _canonical_crypto_symbol(symbol: str, asset_type: str) -> str:
+    cleaned = symbol.strip()
+    if asset_type != "crypto":
+        return cleaned.upper()
+    compact = re.sub(r"[^A-Za-z0-9]", "", cleaned).upper()
+    if not compact:
+        return cleaned
+    base = CRYPTO_NAME_TO_SYMBOL.get(cleaned.lower(), compact)
+    for quote in QUOTE_ASSETS:
+        if compact.endswith(quote) and len(compact) > len(quote):
+            base = compact[: -len(quote)]
+            break
+    if base.endswith("USD"):
+        base = base[:-3]
+    return f"{base}USDT"
+
 def _default_analysts() -> list[AnalystName]:
     return ["market", "news"]
 
@@ -107,6 +124,9 @@ def readyz() -> dict[str, str]:
 
 @app.post("/analyze", response_model=None)
 def analyze(req: AnalyzeRequest) -> dict[str, object]:
+    req = req.model_copy(
+        update={"symbol": _canonical_crypto_symbol(req.symbol, req.asset_type)}
+    )
     job_id = str(uuid4())
     requested_at = _now().isoformat()
     with connect() as conn:

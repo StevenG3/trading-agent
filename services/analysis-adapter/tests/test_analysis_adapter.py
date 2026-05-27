@@ -138,6 +138,38 @@ def test_crypto_symbol_normalization_sent_to_tradingagents_bridge(
     assert seen == ["BTC-USD", "BTC-USD", "BTC-USD"]
 
 
+def test_crypto_natural_language_symbols_are_canonicalized_in_scorecards(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    posted: list[str] = []
+
+    def fake_post(url: str, **kwargs: object) -> FakeResponse:
+        if url.endswith("/analyze"):
+            return FakeResponse({
+                "ok": True,
+                "decision": "HOLD",
+                "provider": "deepseek",
+                "reports": {"market": "rangebound", "news": "quiet"},
+            })
+        if url.endswith("/scorecards"):
+            payload = kwargs.get("json") or {}
+            assert isinstance(payload, dict)
+            posted.append(str(payload["symbol"]))
+            return FakeResponse({"scorecard_id": str(uuid4())})
+        raise AssertionError(url)
+
+    monkeypatch.setattr(adapter_app.httpx, "post", fake_post)
+    client = TestClient(adapter_app.app)
+    for symbol in ["BTCUSDT", "BTC/USDT", "bitcoin"]:
+        job_id = client.post(
+            "/analyze", json={"actor": "u", "symbol": symbol}
+        ).json()["job_id"]
+        _await_job(job_id, status="succeeded")
+
+    assert posted == ["BTCUSDT", "BTCUSDT", "BTCUSDT"]
+
+
 def test_failed_unparseable_ta_response_is_saved_for_diagnosis(
     monkeypatch, tmp_path: Path
 ) -> None:
