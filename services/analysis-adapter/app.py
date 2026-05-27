@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 from datetime import UTC, datetime
 from typing import Literal
@@ -24,6 +25,43 @@ TA_TIMEOUT_SEC = float(os.getenv("TA_TIMEOUT_SEC", "900"))
 SCORECARD_TTL_MIN = int(os.getenv("ANALYSIS_SCORECARD_TTL_MIN", "60"))
 JobStatus = Literal["queued", "running", "succeeded", "failed"]
 AnalystName = Literal["market", "social", "news", "fundamentals"]
+
+CRYPTO_NAME_TO_SYMBOL = {
+    "bitcoin": "BTC",
+    "btc": "BTC",
+    "ethereum": "ETH",
+    "ether": "ETH",
+    "eth": "ETH",
+    "solana": "SOL",
+    "sol": "SOL",
+    "binancecoin": "BNB",
+    "bnb": "BNB",
+    "xrp": "XRP",
+    "ripple": "XRP",
+    "dogecoin": "DOGE",
+    "doge": "DOGE",
+    "cardano": "ADA",
+    "ada": "ADA",
+}
+QUOTE_ASSETS = ("USDT", "USDC", "USD", "BUSD")
+
+
+def _normalize_ta_ticker(symbol: str, asset_type: str) -> str:
+    """Convert user/trading crypto symbols to TradingAgents-friendly tickers."""
+    cleaned = symbol.strip()
+    if asset_type != "crypto":
+        return cleaned.upper()
+    compact = re.sub(r"[^A-Za-z0-9]", "", cleaned).upper()
+    if not compact:
+        return cleaned
+    base = CRYPTO_NAME_TO_SYMBOL.get(cleaned.strip().lower(), compact)
+    for quote in QUOTE_ASSETS:
+        if compact.endswith(quote) and len(compact) > len(quote):
+            base = compact[: -len(quote)]
+            break
+    if base.endswith("USD") and "-" not in cleaned:
+        base = base[:-3]
+    return f"{base}-USD"
 
 
 def _default_analysts() -> list[AnalystName]:
@@ -154,16 +192,19 @@ def _run_analysis_job(job_id: str, req: AnalyzeRequest) -> None:
     _mark_status(job_id, "running")
     try:
         raw = _stub_ta_response(req) if req.dry_run else _call_ta_bridge(req)
-        scorecard_payload = _translate_to_scorecard_payload(req, raw)
-        scorecard_id = _post_scorecard(scorecard_payload)
-        _mark_success(job_id, scorecard_id, raw)
+        try:
+            scorecard_payload = _translate_to_scorecard_payload(req, raw)
+            scorecard_id = _post_scorecard(scorecard_payload)
+            _mark_success(job_id, scorecard_id, raw)
+        except Exception as exc:  # noqa: BLE001
+            _mark_failure(job_id, str(exc)[:500], raw)
     except Exception as exc:  # noqa: BLE001
         _mark_failure(job_id, str(exc)[:500])
 
 
 def _call_ta_bridge(req: AnalyzeRequest) -> dict[str, object]:
     payload: dict[str, object] = {
-        "ticker": req.symbol,
+        "ticker": _normalize_ta_ticker(req.symbol, req.asset_type),
         "date": _now().strftime("%Y-%m-%d"),
         "provider": req.provider or TA_DEFAULT_PROVIDER,
         "asset_type": req.asset_type,
@@ -189,7 +230,7 @@ def _stub_ta_response(req: AnalyzeRequest) -> dict[str, object]:
     return {
         "ok": True,
         "dry_run": True,
-        "ticker": req.symbol,
+        "ticker": _normalize_ta_ticker(req.symbol, req.asset_type),
         "provider": req.provider or TA_DEFAULT_PROVIDER,
         "decision": "BUY",
         "final_trade_decision": "FINAL TRANSACTION PROPOSAL: **BUY**",
@@ -293,11 +334,16 @@ def _mark_success(job_id: str, scorecard_id: str, raw: dict[str, object]) -> Non
         conn.commit()
 
 
-def _mark_failure(job_id: str, error: str) -> None:
+def _mark_failure(job_id: str, error: str, raw: dict[str, object] | None = None) -> None:
     with connect() as conn:
         conn.execute(
-            "update analysis_jobs set status = 'failed', error = ?, finished_at = ? "
-            "where job_id = ?",
-            (error, _now().isoformat(), job_id),
+            "update analysis_jobs set status = 'failed', error = ?, "
+            "raw_response_json = ?, finished_at = ? where job_id = ?",
+            (
+                error,
+                json.dumps(raw, default=str) if raw is not None else None,
+                _now().isoformat(),
+                job_id,
+            ),
         )
         conn.commit()

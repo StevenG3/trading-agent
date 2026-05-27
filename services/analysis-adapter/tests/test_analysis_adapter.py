@@ -105,6 +105,63 @@ def test_analyze_propagates_ta_decision_to_action(monkeypatch, tmp_path: Path) -
     assert posted["conviction"] == "0.7000"
 
 
+
+def test_crypto_symbol_normalization_sent_to_tradingagents_bridge(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    seen: list[str] = []
+
+    def fake_post(url: str, **kwargs: object) -> FakeResponse:
+        if url.endswith("/analyze"):
+            payload = kwargs.get("json") or {}
+            assert isinstance(payload, dict)
+            seen.append(str(payload["ticker"]))
+            return FakeResponse({
+                "ok": True,
+                "decision": "HOLD",
+                "provider": "deepseek",
+                "reports": {"market": "rangebound", "news": "quiet"},
+            })
+        if url.endswith("/scorecards"):
+            return FakeResponse({"scorecard_id": str(uuid4())})
+        raise AssertionError(url)
+
+    monkeypatch.setattr(adapter_app.httpx, "post", fake_post)
+    client = TestClient(adapter_app.app)
+    for symbol in ["BTCUSDT", "BTC/USDT", "bitcoin"]:
+        job_id = client.post(
+            "/analyze", json={"actor": "u", "symbol": symbol}
+        ).json()["job_id"]
+        _await_job(job_id, status="succeeded")
+
+    assert seen == ["BTC-USD", "BTC-USD", "BTC-USD"]
+
+
+def test_failed_unparseable_ta_response_is_saved_for_diagnosis(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    raw = {"ok": True, "decision": "PROBABLY", "final_trade_decision": "unclear"}
+
+    def fake_post(url: str, **kwargs: object) -> FakeResponse:
+        if url.endswith("/analyze"):
+            return FakeResponse(raw)
+        raise AssertionError(url)
+
+    monkeypatch.setattr(adapter_app.httpx, "post", fake_post)
+    job_id = TestClient(adapter_app.app).post(
+        "/analyze", json={"actor": "u", "symbol": "BTCUSDT"}
+    ).json()["job_id"]
+    _await_job(job_id, status="failed")
+
+    with adapter_app.connect() as conn:
+        row = conn.execute(
+            "select raw_response_json from analysis_jobs where job_id = ?", (job_id,)
+        ).fetchone()
+    assert row is not None
+    assert row["raw_response_json"] == adapter_app.json.dumps(raw, default=str)
+
 def test_analyze_ta_failure_marks_job_failed(monkeypatch, tmp_path: Path) -> None:
     import httpx as _httpx
 
