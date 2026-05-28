@@ -253,6 +253,8 @@ The orchestrator can recompute conviction calibration from reflected closed scor
 
 Phase 16 adds live-autonomy controls, but the default remains fully off. A live autonomous order can fire only when all gates pass: `LIVE_TRADING_ENABLED=true`, exchange credentials are present, `LIVE_AUTONOMY_GLOBAL_ENABLED=true`, the actor has opted in through `/live-autonomy/settings`, calibration sample thresholds pass, daily spend and trade-count limits have room, drawdown is not breached, and the global live-autonomy kill switch is not engaged.
 
+Phase 18 also adds a protective watchdog for open scorecard outcomes. When enabled with `STOP_LOSS_WATCHDOG_ENABLED=true`, the scheduler checks open outcomes in batches, compares the current mark price with the scorecard `stop_loss` and `take_profit`, and submits a reduce-only sell through the same `/intents` path. Live protective sells mint an intent-bound unlock token internally; row-level failures are counted and never crash the scheduler.
+
 Operator controls:
 
 ```bash

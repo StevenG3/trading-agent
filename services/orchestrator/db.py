@@ -82,6 +82,33 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    for column, default in (
+        ("paper_qty", "0"),
+        ("paper_avg_cost", "0"),
+        ("live_qty", "0"),
+        ("live_avg_cost", "0"),
+    ):
+        try:
+            conn.execute(
+                f"alter table paper_positions add column {column} text not null default '{default}'"
+            )
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+    conn.execute(
+        """
+        update paper_positions
+        set paper_qty = qty
+        where paper_qty = '0' and cast(qty as real) != 0
+        """
+    )
+    conn.execute(
+        """
+        update paper_positions
+        set paper_avg_cost = avg_cost
+        where paper_avg_cost = '0' and cast(qty as real) != 0
+        """
+    )
     conn.execute(
         "create index if not exists idx_daily_fills_date_symbol on daily_fills(date, symbol)"
     )

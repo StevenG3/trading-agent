@@ -74,6 +74,9 @@ AUTO_TRADE_BATCH_LIMIT = int(os.getenv("AUTO_TRADE_BATCH_LIMIT", "5"))
 LIVE_AUTONOMY_GLOBAL_ENABLED = os.getenv("LIVE_AUTONOMY_GLOBAL_ENABLED", "false").lower() == "true"
 LIVE_AUTO_TICK_SEC = float(os.getenv("LIVE_AUTO_TICK_SEC", "300"))
 LIVE_AUTO_BATCH_LIMIT = int(os.getenv("LIVE_AUTO_BATCH_LIMIT", "1"))
+STOP_LOSS_WATCHDOG_ENABLED = os.getenv("STOP_LOSS_WATCHDOG_ENABLED", "true").lower() == "true"
+STOP_LOSS_TICK_SEC = float(os.getenv("STOP_LOSS_TICK_SEC", "60"))
+STOP_LOSS_BATCH_LIMIT = int(os.getenv("STOP_LOSS_BATCH_LIMIT", "20"))
 CALIBRATION_MIN_SAMPLES = int(os.getenv("CALIBRATION_MIN_SAMPLES", "5"))
 CALIBRATION_SHRINKAGE_K = Decimal(os.getenv("CALIBRATION_SHRINKAGE_K", "10"))
 NOTIFICATION_HOST_ALLOWLIST = frozenset(
@@ -306,6 +309,7 @@ def scheduler_tick(now: datetime | None = None) -> dict[str, int]:
 
 async def _scheduler_loop() -> None:
     last_live_auto_tick = 0.0
+    last_stop_loss_tick = 0.0
     while True:
         try:
             scheduler_tick()
@@ -322,6 +326,12 @@ async def _scheduler_loop() -> None:
             except Exception:
                 pass
             last_live_auto_tick = now_mono
+        if now_mono - last_stop_loss_tick >= STOP_LOSS_TICK_SEC:
+            try:
+                stop_loss_watchdog_tick()
+            except Exception:
+                pass
+            last_stop_loss_tick = now_mono
         await asyncio.sleep(SCHEDULER_TICK_SEC)
 
 
@@ -833,40 +843,64 @@ def _update_position(execution: ExecutionResult, intent: OrderIntent) -> None:
         return
     fill_qty = _q8(execution.filled_qty)
     fill_price = execution.avg_price
+    qty_col = "live_qty" if intent.mode == "live" else "paper_qty"
+    avg_col = "live_avg_cost" if intent.mode == "live" else "paper_avg_cost"
     with connect() as conn:
         row = conn.execute(
-            "select qty, avg_cost, total_cost, realized_pnl from paper_positions "
+            "select qty, avg_cost, total_cost, realized_pnl, "
+            "paper_qty, paper_avg_cost, live_qty, live_avg_cost from paper_positions "
             "where actor = ? and symbol = ?",
             (intent.actor, intent.symbol),
         ).fetchone()
-        old_qty = Decimal(row["qty"]) if row else Decimal("0")
-        old_avg = Decimal(row["avg_cost"]) if row else Decimal("0")
+        old_bucket_qty = Decimal(row[qty_col]) if row else Decimal("0")
+        old_bucket_avg = Decimal(row[avg_col]) if row else Decimal("0")
         old_realized = Decimal(row["realized_pnl"]) if row else Decimal("0")
+        paper_qty = Decimal(row["paper_qty"]) if row else Decimal("0")
+        paper_avg = Decimal(row["paper_avg_cost"]) if row else Decimal("0")
+        live_qty = Decimal(row["live_qty"]) if row else Decimal("0")
+        live_avg = Decimal(row["live_avg_cost"]) if row else Decimal("0")
 
         if intent.side == "buy":
-            new_qty = _q8(old_qty + fill_qty)
-            total_cost = _q8((old_qty * old_avg) + (fill_qty * fill_price))
-            avg_cost = _q8(total_cost / new_qty) if new_qty else Decimal("0")
+            new_bucket_qty = _q8(old_bucket_qty + fill_qty)
+            bucket_total = _q8((old_bucket_qty * old_bucket_avg) + (fill_qty * fill_price))
+            new_bucket_avg = _q8(bucket_total / new_bucket_qty) if new_bucket_qty else Decimal("0")
             realized = old_realized
             realized_delta = Decimal("0")
         else:
-            sell_qty = min(fill_qty, old_qty)
-            new_qty = _q8(old_qty - sell_qty)
-            realized_delta = _q8(sell_qty * (fill_price - old_avg))
+            sell_qty = min(fill_qty, old_bucket_qty)
+            new_bucket_qty = _q8(old_bucket_qty - sell_qty)
+            realized_delta = _q8(sell_qty * (fill_price - old_bucket_avg))
             realized = _q8(old_realized + realized_delta)
-            avg_cost = _q8(old_avg if new_qty else Decimal("0"))
-            total_cost = _q8(new_qty * avg_cost)
+            new_bucket_avg = _q8(old_bucket_avg if new_bucket_qty else Decimal("0"))
+
+        if intent.mode == "live":
+            live_qty = new_bucket_qty
+            live_avg = new_bucket_avg
+        else:
+            paper_qty = new_bucket_qty
+            paper_avg = new_bucket_avg
+
+        new_qty = _q8(paper_qty + live_qty)
+        paper_cost = _q8(paper_qty * paper_avg)
+        live_cost = _q8(live_qty * live_avg)
+        total_cost = _q8(paper_cost + live_cost)
+        avg_cost = _q8(total_cost / new_qty) if new_qty else Decimal("0")
 
         conn.execute(
             """
             insert into paper_positions
-            (actor, symbol, qty, avg_cost, total_cost, realized_pnl, last_updated)
-            values (?, ?, ?, ?, ?, ?, ?)
+            (actor, symbol, qty, avg_cost, total_cost, realized_pnl,
+             paper_qty, paper_avg_cost, live_qty, live_avg_cost, last_updated)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(actor, symbol) do update set
                 qty = excluded.qty,
                 avg_cost = excluded.avg_cost,
                 total_cost = excluded.total_cost,
                 realized_pnl = excluded.realized_pnl,
+                paper_qty = excluded.paper_qty,
+                paper_avg_cost = excluded.paper_avg_cost,
+                live_qty = excluded.live_qty,
+                live_avg_cost = excluded.live_avg_cost,
                 last_updated = excluded.last_updated
             """,
             (
@@ -876,6 +910,10 @@ def _update_position(execution: ExecutionResult, intent: OrderIntent) -> None:
                 _q8s(avg_cost),
                 _q8s(total_cost),
                 _q8s(realized),
+                _q8s(paper_qty),
+                _q8s(paper_avg),
+                _q8s(live_qty),
+                _q8s(live_avg),
                 _now().isoformat(),
             ),
         )
@@ -1253,24 +1291,163 @@ def _check_live_exposure_cap(
     with connect() as conn:
         rows = conn.execute(
             """
-            select p.qty, p.avg_cost
+            select p.live_qty, p.live_avg_cost
             from paper_positions p
             where p.actor = ?
-              and cast(p.qty as real) > 0
-              and exists (
-                select 1 from intents i
-                where json_extract(i.payload_json, '$.actor') = p.actor
-                  and json_extract(i.payload_json, '$.symbol') = p.symbol
-                  and json_extract(i.payload_json, '$.mode') = 'live'
-              )
+              and cast(p.live_qty as real) > 0
             """,
             (actor,),
         ).fetchall()
     current = Decimal("0")
     for row in rows:
-        current += Decimal(str(row["qty"])) * Decimal(str(row["avg_cost"]))
+        current += Decimal(str(row["live_qty"])) * Decimal(str(row["live_avg_cost"]))
     current = _q8(current)
     return current + proposed_notional <= max_cap, current
+
+
+def stop_loss_watchdog_tick(now: datetime | None = None) -> dict[str, int]:
+    if not STOP_LOSS_WATCHDOG_ENABLED:
+        return {"checked": 0, "fired": 0, "skipped": 0, "failed": 0}
+    _ = now
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            select o.outcome_id, o.scorecard_id, o.actor, o.symbol, o.opened_intent_id,
+                   o.opened_qty, s.payload_json
+            from scorecard_outcomes o
+            join scorecards s on s.scorecard_id = o.scorecard_id
+            where o.status = 'open'
+            order by o.opened_at asc
+            limit ?
+            """,
+            (STOP_LOSS_BATCH_LIMIT,),
+        ).fetchall()
+
+    checked = len(rows)
+    fired = 0
+    skipped = 0
+    failed = 0
+    for row in rows:
+        try:
+            payload = json.loads(str(row["payload_json"]))
+            if not isinstance(payload, dict):
+                skipped += 1
+                continue
+            stop_loss = _optional_decimal(payload.get("stop_loss"))
+            take_profit = _optional_decimal(payload.get("take_profit"))
+            if stop_loss is None and take_profit is None:
+                skipped += 1
+                continue
+            mark, _source = _mark_for_symbol(str(row["symbol"]))
+            if mark is None:
+                skipped += 1
+                continue
+            should_sell = (stop_loss is not None and mark <= stop_loss) or (
+                take_profit is not None and mark >= take_profit
+            )
+            if not should_sell:
+                skipped += 1
+                continue
+            if _fire_protective_sell(row):
+                fired += 1
+            else:
+                failed += 1
+        except Exception:
+            failed += 1
+    return {"checked": checked, "fired": fired, "skipped": skipped, "failed": failed}
+
+
+def _optional_decimal(value: object) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _fire_protective_sell(row: sqlite3.Row) -> bool:
+    actor = str(row["actor"])
+    symbol = str(row["symbol"])
+    opened_intent_id = str(row["opened_intent_id"])
+    mode = _opened_intent_mode(opened_intent_id)
+    qty = _protective_sell_qty(actor, symbol, mode, str(row["opened_qty"]))
+    if qty <= 0:
+        return False
+    intent_id = uuid4()
+    payload: dict[str, object] = {
+        "intent_id": str(intent_id),
+        "request_id": str(uuid4()),
+        "idempotency_key": f"protective-{row['outcome_id']}-{int(time.time())}",
+        "actor": actor,
+        "created_at": _now().isoformat(),
+        "mode": mode,
+        "venue": "binance_spot",
+        "symbol": symbol,
+        "side": "sell",
+        "order_type": "market",
+        "quantity": {"kind": "base", "value": _q8s(qty)},
+        "limit_price": None,
+        "time_in_force": "GTC",
+        "reduce_only": True,
+        "leverage": None,
+        "stop_loss": None,
+        "take_profit": None,
+        "source": {
+            "origin": "scorecard",
+            "scorecard_id": str(row["scorecard_id"]),
+            "hermes_message_id": None,
+        },
+        "client_confirmation_required": False,
+    }
+    headers: dict[str, str] = {}
+    if mode == "live":
+        headers["x-live-unlock"] = _mint_auto_unlock_bound_token(actor, intent_id)
+    try:
+        response = httpx.post(
+            f"{ORCHESTRATOR_SELF_URL}/intents",
+            json=payload,
+            headers=headers,
+            timeout=15.0,
+        )
+        response.raise_for_status()
+        body = response.json()
+    except (httpx.HTTPError, ValueError):
+        return False
+    return isinstance(body, dict) and body.get("status") in {
+        "executed",
+        "pending_confirmation",
+        "open",
+    }
+
+
+def _opened_intent_mode(intent_id: str) -> Literal["paper", "live"]:
+    with connect() as conn:
+        row = conn.execute(
+            "select payload_json from intents where intent_id = ?",
+            (intent_id,),
+        ).fetchone()
+    if row is None:
+        return "paper"
+    try:
+        payload = json.loads(str(row["payload_json"]))
+    except json.JSONDecodeError:
+        return "paper"
+    mode = payload.get("mode") if isinstance(payload, dict) else None
+    return "live" if mode == "live" else "paper"
+
+
+def _protective_sell_qty(actor: str, symbol: str, mode: str, opened_qty: str) -> Decimal:
+    with connect() as conn:
+        row = conn.execute(
+            "select paper_qty, live_qty from paper_positions where actor = ? and symbol = ?",
+            (actor, symbol),
+        ).fetchone()
+    if row is None:
+        return Decimal("0")
+    bucket_qty = Decimal(str(row["live_qty"] if mode == "live" else row["paper_qty"]))
+    opened = Decimal(opened_qty)
+    return _q8(min(bucket_qty, opened))
 
 
 def _eligible_for_live_auto(

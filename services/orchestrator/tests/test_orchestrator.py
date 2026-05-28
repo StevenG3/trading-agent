@@ -3328,8 +3328,11 @@ def test_live_exposure_cap_defaults_closed_and_blocks_breach(
     settings["max_live_exposure_usdt"] = "100"
     with orchestrator_app.connect() as conn:
         conn.execute(
-            "insert into paper_positions values (?,?,?,?,?,?,?)",
-            ("tg_1", "BTCUSDT", "0.001", "90000", "90", "0", "now"),
+            "insert into paper_positions "
+            "(actor, symbol, qty, avg_cost, total_cost, realized_pnl, "
+            "paper_qty, paper_avg_cost, live_qty, live_avg_cost, last_updated) "
+            "values (?,?,?,?,?,?,?,?,?,?,?)",
+            ("tg_1", "BTCUSDT", "0.001", "90000", "90", "0", "0", "0", "0.001", "90000", "now"),
         )
         conn.execute(
             "insert into intents (intent_id, payload_json, created_at, status, idempotency_key) "
@@ -3422,6 +3425,324 @@ def test_notification_subscribe_sends_hmac_fill_and_records_delivery(
     deliveries = client.get("/notifications/deliveries", params={"actor": "tg_1"}).json()
     assert deliveries["deliveries"][0]["ok"] is True
     assert deliveries["deliveries"][0]["status_code"] == 204
+
+
+def test_position_updates_keep_paper_and_live_buckets_separate(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    paper_intent = orchestrator_app.OrderIntent.model_validate(VALID)
+    live_intent = orchestrator_app.OrderIntent.model_validate(
+        {
+            **VALID,
+            "intent_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "idempotency_key": "live-fill-1",
+            "mode": "live",
+        }
+    )
+
+    orchestrator_app._update_position(
+        orchestrator_app.ExecutionResult.model_validate(
+            execution(filled_qty="0.002", avg_price="100000.00")
+        ),
+        paper_intent,
+    )
+    orchestrator_app._update_position(
+        orchestrator_app.ExecutionResult.model_validate(
+            execution(
+                intent_id=live_intent.intent_id,
+                filled_qty="0.001",
+                avg_price="90000.00",
+                execution_id="55555555-5555-4555-8555-555555555555",
+            )
+        ),
+        live_intent,
+    )
+
+    with orchestrator_app.connect() as conn:
+        row = conn.execute(
+            "select qty, avg_cost, paper_qty, paper_avg_cost, live_qty, live_avg_cost "
+            "from paper_positions where actor = ? and symbol = ?",
+            ("user_1", "BTCUSDT"),
+        ).fetchone()
+    assert row["paper_qty"] == "0.00200000"
+    assert row["paper_avg_cost"] == "100000.00000000"
+    assert row["live_qty"] == "0.00100000"
+    assert row["live_avg_cost"] == "90000.00000000"
+    assert row["qty"] == "0.00300000"
+    assert row["avg_cost"] == "96666.66666667"
+
+
+def test_legacy_position_qty_backfills_paper_bucket(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    db_file = tmp_path / "trading.sqlite"
+    conn = sqlite3.connect(db_file)
+    conn.execute(
+        """
+        create table paper_positions (
+            actor text not null,
+            symbol text not null,
+            qty text not null default '0',
+            avg_cost text not null default '0',
+            total_cost text not null default '0',
+            realized_pnl text not null default '0',
+            last_updated text not null,
+            primary key (actor, symbol)
+        )
+        """
+    )
+    conn.execute(
+        "insert into paper_positions values (?,?,?,?,?,?,?)",
+        ("tg_1", "BTCUSDT", "0.004", "50000", "200", "0", "legacy"),
+    )
+    conn.commit()
+    conn.close()
+
+    with orchestrator_app.connect() as migrated:
+        row = migrated.execute(
+            "select paper_qty, paper_avg_cost, live_qty, live_avg_cost "
+            "from paper_positions where actor = ? and symbol = ?",
+            ("tg_1", "BTCUSDT"),
+        ).fetchone()
+    assert row["paper_qty"] == "0.004"
+    assert row["paper_avg_cost"] == "50000"
+    assert row["live_qty"] == "0"
+    assert row["live_avg_cost"] == "0"
+
+
+def test_live_exposure_cap_uses_live_bucket_only(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    with orchestrator_app.connect() as conn:
+        conn.execute(
+            """
+            insert into paper_positions
+              (actor, symbol, qty, avg_cost, total_cost, realized_pnl,
+               paper_qty, paper_avg_cost, live_qty, live_avg_cost, last_updated)
+            values (?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "tg_1",
+                "BTCUSDT",
+                "0.003",
+                "96666.66666667",
+                "290",
+                "0",
+                "0.002",
+                "100000",
+                "0.001",
+                "90000",
+                "now",
+            ),
+        )
+        conn.commit()
+
+    allowed, current = orchestrator_app._check_live_exposure_cap(
+        "tg_1", Decimal("5"), Decimal("100")
+    )
+
+    assert allowed is True
+    assert current == Decimal("90.00000000")
+
+
+def test_stop_loss_watchdog_fires_paper_protective_sell(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(orchestrator_app, "STOP_LOSS_WATCHDOG_ENABLED", True)
+    monkeypatch.setattr(
+        orchestrator_app,
+        "_mark_for_symbol",
+        lambda symbol: (Decimal("89000"), "test"),
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_post(url: str, **kwargs: object) -> FakeResponse:
+        calls.append({"url": url, **kwargs})
+        return FakeResponse({"status": "executed"})
+
+    monkeypatch.setattr(orchestrator_app.httpx, "post", fake_post)
+    _seed_open_outcome_with_position(
+        actor="tg_1",
+        mode="paper",
+        stop_loss="90000",
+        take_profit="120000",
+    )
+
+    result = orchestrator_app.stop_loss_watchdog_tick()
+
+    assert result == {"checked": 1, "fired": 1, "skipped": 0, "failed": 0}
+    assert len(calls) == 1
+    sent = calls[0]
+    assert str(sent["url"]).endswith("/intents")
+    payload = sent["json"]
+    assert isinstance(payload, dict)
+    assert payload["actor"] == "tg_1"
+    assert payload["symbol"] == "BTCUSDT"
+    assert payload["side"] == "sell"
+    assert payload["mode"] == "paper"
+    assert payload["quantity"] == {"kind": "base", "value": "0.00200000"}
+    assert "x-live-unlock" not in sent.get("headers", {})
+
+
+def test_stop_loss_watchdog_mints_bound_token_for_live_sell(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(orchestrator_app, "STOP_LOSS_WATCHDOG_ENABLED", True)
+    monkeypatch.setattr(
+        orchestrator_app,
+        "_mark_for_symbol",
+        lambda symbol: (Decimal("121000"), "test"),
+    )
+    captured: dict[str, object] = {}
+
+    def fake_post(url: str, **kwargs: object) -> FakeResponse:
+        captured.update({"url": url, **kwargs})
+        return FakeResponse({"status": "executed"})
+
+    monkeypatch.setattr(orchestrator_app.httpx, "post", fake_post)
+    _seed_open_outcome_with_position(
+        actor="tg_1",
+        mode="live",
+        stop_loss="90000",
+        take_profit="120000",
+    )
+
+    result = orchestrator_app.stop_loss_watchdog_tick()
+
+    assert result["fired"] == 1
+    payload = captured["json"]
+    headers = captured["headers"]
+    assert isinstance(payload, dict)
+    assert isinstance(headers, dict)
+    assert payload["mode"] == "live"
+    token = headers["x-live-unlock"]
+    with orchestrator_app.connect() as conn:
+        row = conn.execute(
+            "select actor, bound_intent_id from live_unlock_tokens where token = ?",
+            (token,),
+        ).fetchone()
+    assert row["actor"] == "tg_1"
+    assert row["bound_intent_id"] == payload["intent_id"]
+
+
+def test_stop_loss_watchdog_never_raises_per_row(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(orchestrator_app, "STOP_LOSS_WATCHDOG_ENABLED", True)
+
+    def fail_mark(symbol: str) -> tuple[Decimal | None, str | None]:
+        raise RuntimeError("market down")
+
+    monkeypatch.setattr(orchestrator_app, "_mark_for_symbol", fail_mark)
+    _seed_open_outcome_with_position(
+        actor="tg_1",
+        mode="paper",
+        stop_loss="90000",
+        take_profit="120000",
+    )
+
+    result = orchestrator_app.stop_loss_watchdog_tick()
+
+    assert result == {"checked": 1, "fired": 0, "skipped": 0, "failed": 1}
+
+
+def _seed_open_outcome_with_position(
+    *,
+    actor: str,
+    mode: str,
+    stop_loss: str,
+    take_profit: str,
+) -> None:
+    now = datetime.now(UTC).isoformat()
+    scorecard_id = f"scorecard-{mode}"
+    opened_intent_id = f"11111111-1111-4111-8111-00000000000{1 if mode == 'paper' else 2}"
+    paper_qty = "0.00200000" if mode == "paper" else "0"
+    live_qty = "0.00200000" if mode == "live" else "0"
+    with orchestrator_app.connect() as conn:
+        conn.execute(
+            """
+            insert into scorecards
+              (scorecard_id, actor, symbol, action, source, payload_json,
+               created_at, expires_at, consumed_by_intent_id)
+            values (?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                scorecard_id,
+                actor,
+                "BTCUSDT",
+                "buy",
+                "tradingagents",
+                json.dumps(
+                    {
+                        "symbol": "BTCUSDT",
+                        "action": "buy",
+                        "stop_loss": stop_loss,
+                        "take_profit": take_profit,
+                    }
+                ),
+                now,
+                (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+                opened_intent_id,
+            ),
+        )
+        conn.execute(
+            """
+            insert into intents (intent_id, payload_json, created_at, status, idempotency_key)
+            values (?,?,?,?,?)
+            """,
+            (
+                opened_intent_id,
+                json.dumps({"actor": actor, "symbol": "BTCUSDT", "mode": mode}),
+                now,
+                "executed",
+                f"open-{mode}",
+            ),
+        )
+        conn.execute(
+            """
+            insert into paper_positions
+              (actor, symbol, qty, avg_cost, total_cost, realized_pnl,
+               paper_qty, paper_avg_cost, live_qty, live_avg_cost, last_updated)
+            values (?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                actor,
+                "BTCUSDT",
+                "0.00200000",
+                "100000.00000000",
+                "200.00000000",
+                "0",
+                paper_qty,
+                "100000.00000000" if mode == "paper" else "0",
+                live_qty,
+                "100000.00000000" if mode == "live" else "0",
+                now,
+            ),
+        )
+        conn.execute(
+            """
+            insert into scorecard_outcomes
+              (outcome_id, scorecard_id, actor, symbol, source, action,
+               opened_intent_id, opened_at, opened_qty, opened_avg_cost,
+               opened_cost_basis, status, closed_at, closed_realized_pnl,
+               closed_return_pct, notes)
+            values (?,?,?,?,?,?,?,?,?,?,?,'open',NULL,NULL,NULL,NULL)
+            """,
+            (
+                f"outcome-{mode}",
+                scorecard_id,
+                actor,
+                "BTCUSDT",
+                "tradingagents",
+                "buy",
+                opened_intent_id,
+                now,
+                "0.00200000",
+                "100000.00000000",
+                "200.00000000",
+            ),
+        )
+        conn.commit()
 
 
 def test_notification_rejects_disallowed_host_and_prunes_history(
