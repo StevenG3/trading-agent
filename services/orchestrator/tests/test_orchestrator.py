@@ -3422,6 +3422,8 @@ def test_notification_subscribe_sends_hmac_fill_and_records_delivery(
     }
     expected = hmac.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
     assert headers["x-trading-agent-signature"] == expected
+    assert headers["X-Hub-Signature-256"] == f"sha256={expected}"
+    assert headers["X-GitHub-Event"] == "fill"
     deliveries = client.get("/notifications/deliveries", params={"actor": "tg_1"}).json()
     assert deliveries["deliveries"][0]["ok"] is True
     assert deliveries["deliveries"][0]["status_code"] == 204

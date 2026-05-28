@@ -583,6 +583,8 @@ def _deliver_webhook(
             content=body,
             headers={
                 "content-type": "application/json",
+                "X-GitHub-Event": event_type,
+                "X-Hub-Signature-256": f"sha256={signature}",
                 "x-trading-agent-event": event_type,
                 "x-trading-agent-signature": signature,
             },
