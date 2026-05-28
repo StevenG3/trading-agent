@@ -25,6 +25,7 @@ def load_service_app(name: str):
 
 
 orchestrator_app = load_service_app("orchestrator_service_app")
+TRAILING_OUTCOME_ID = "11111111-1111-4111-8111-000000000001"
 VALID = {
     "intent_id": "11111111-1111-4111-8111-111111111111",
     "request_id": "22222222-2222-4222-8222-222222222222",
@@ -193,6 +194,7 @@ def make_scorecard_payload(
     stop_loss: str | None = "90000.00",
     take_profit: str | None = "110000.00",
     thesis: str = "Breakout above 100k support retest",
+    metadata: dict[str, str] | None = None,
 ) -> dict[str, object]:
     return {
         "actor": actor,
@@ -207,6 +209,7 @@ def make_scorecard_payload(
         "take_profit": take_profit,
         "time_horizon": time_horizon,
         "ttl_minutes": ttl_minutes,
+        "metadata": metadata,
     }
 
 
@@ -3648,12 +3651,207 @@ def test_stop_loss_watchdog_never_raises_per_row(monkeypatch, tmp_path: Path) ->
     assert result == {"checked": 1, "fired": 0, "skipped": 0, "failed": 1}
 
 
+def test_watchdog_updates_peak_mark_monotonically(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(orchestrator_app, "STOP_LOSS_WATCHDOG_ENABLED", True)
+    marks = iter([Decimal("100000"), Decimal("110000"), Decimal("105000")])
+    monkeypatch.setattr(
+        orchestrator_app,
+        "_mark_for_symbol",
+        lambda symbol: (next(marks), "test"),
+    )
+    monkeypatch.setattr(
+        orchestrator_app.httpx,
+        "post",
+        lambda *args, **kwargs: FakeResponse({"status": "executed"}),
+    )
+    _seed_open_outcome_with_position(
+        actor="tg_1",
+        mode="paper",
+        stop_loss="50000",
+        take_profit="200000",
+        trailing_pct="0.20",
+    )
+
+    assert orchestrator_app.stop_loss_watchdog_tick()["skipped"] == 1
+    assert _peak_mark(TRAILING_OUTCOME_ID) == "100000"
+    assert orchestrator_app.stop_loss_watchdog_tick()["skipped"] == 1
+    assert _peak_mark(TRAILING_OUTCOME_ID) == "110000"
+    assert orchestrator_app.stop_loss_watchdog_tick()["skipped"] == 1
+    assert _peak_mark(TRAILING_OUTCOME_ID) == "110000"
+
+
+def test_trailing_stop_fires_at_5pct_drop(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(orchestrator_app, "STOP_LOSS_WATCHDOG_ENABLED", True)
+    monkeypatch.setattr(
+        orchestrator_app,
+        "_mark_for_symbol",
+        lambda symbol: (Decimal("113999"), "test"),
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_post(url: str, **kwargs: object) -> FakeResponse:
+        calls.append({"url": url, **kwargs})
+        return FakeResponse({"status": "executed"})
+
+    monkeypatch.setattr(
+        orchestrator_app.httpx,
+        "post",
+        fake_post,
+    )
+    _seed_open_outcome_with_position(
+        actor="tg_1",
+        mode="paper",
+        stop_loss="50000",
+        take_profit="200000",
+        trailing_pct="0.05",
+        peak_mark="120000",
+    )
+
+    result = orchestrator_app.stop_loss_watchdog_tick()
+
+    assert result == {"checked": 1, "fired": 1, "skipped": 0, "failed": 0}
+    assert "trailing" in calls[0]["json"]["idempotency_key"]
+
+
+def test_trailing_stop_disabled_when_pct_zero(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(orchestrator_app, "STOP_LOSS_WATCHDOG_ENABLED", True)
+    monkeypatch.setattr(
+        orchestrator_app,
+        "_mark_for_symbol",
+        lambda symbol: (Decimal("1"), "test"),
+    )
+    calls: list[object] = []
+
+    def fake_post(*args: object, **kwargs: object) -> None:
+        calls.append(kwargs)
+
+    monkeypatch.setattr(orchestrator_app.httpx, "post", fake_post)
+    _seed_open_outcome_with_position(
+        actor="tg_1",
+        mode="paper",
+        stop_loss="0",
+        take_profit="200000",
+        trailing_pct="0",
+        peak_mark="120000",
+    )
+
+    result = orchestrator_app.stop_loss_watchdog_tick()
+
+    assert result == {"checked": 1, "fired": 0, "skipped": 1, "failed": 0}
+    assert calls == []
+
+
+def test_post_trailing_endpoint_updates_outcome(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    _seed_open_outcome_with_position(
+        actor="tg_1", mode="paper", stop_loss="90000", take_profit="120000"
+    )
+
+    response = TestClient(orchestrator_app.app).post(
+        f"/scorecard-outcomes/{TRAILING_OUTCOME_ID}/trailing",
+        json={"trailing_pct": "0.05"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["trailing_pct"] == "0.05"
+    with orchestrator_app.connect() as conn:
+        row = conn.execute(
+            "select trailing_pct from scorecard_outcomes where outcome_id = ?",
+            (TRAILING_OUTCOME_ID,),
+        ).fetchone()
+    assert row["trailing_pct"] == "0.05"
+
+
+def test_post_trailing_rejects_out_of_range(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    _seed_open_outcome_with_position(
+        actor="tg_1", mode="paper", stop_loss="90000", take_profit="120000"
+    )
+    client = TestClient(orchestrator_app.app)
+    assert (
+        client.post(
+            f"/scorecard-outcomes/{TRAILING_OUTCOME_ID}/trailing",
+            json={"trailing_pct": "-0.1"},
+        ).status_code
+        == 400
+    )
+    assert (
+        client.post(
+            f"/scorecard-outcomes/{TRAILING_OUTCOME_ID}/trailing",
+            json={"trailing_pct": "1.5"},
+        ).status_code
+        == 400
+    )
+
+
+def test_post_trailing_404_on_closed_outcome(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    _seed_open_outcome_with_position(
+        actor="tg_1", mode="paper", stop_loss="90000", take_profit="120000"
+    )
+    with orchestrator_app.connect() as conn:
+        conn.execute(
+            "update scorecard_outcomes set status = 'closed' where outcome_id = ?",
+            (TRAILING_OUTCOME_ID,),
+        )
+        conn.commit()
+
+    response = TestClient(orchestrator_app.app).post(
+        f"/scorecard-outcomes/{TRAILING_OUTCOME_ID}/trailing",
+        json={"trailing_pct": "0.05"},
+    )
+
+    assert response.status_code == 404
+
+
+def test_outcome_open_captures_trailing_from_metadata(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    client = TestClient(orchestrator_app.app)
+
+    def fake_post(url: str, **kwargs: object) -> FakeResponse:
+        if url.endswith("/validate"):
+            return FakeResponse(decision())
+        return FakeResponse(execution())
+
+    monkeypatch.setattr(orchestrator_app.httpx, "post", fake_post)
+    sc = make_scorecard_payload(actor="user_1", metadata={"trailing_pct": "0.07"})
+    scorecard = client.post("/scorecards", json=sc).json()
+    response = client.post(
+        "/intents/from_scorecard",
+        json={
+            "scorecard_id": scorecard["scorecard_id"],
+            "actor": "user_1",
+            "idempotency_key": "trail-open",
+            "usdt_budget": "100",
+            "mode": "paper",
+        },
+    )
+    assert response.status_code == 200
+    with orchestrator_app.connect() as conn:
+        row = conn.execute("select trailing_pct from scorecard_outcomes").fetchone()
+    assert row["trailing_pct"] == "0.07"
+
+
+def _peak_mark(outcome_id: str) -> str:
+    with orchestrator_app.connect() as conn:
+        row = conn.execute(
+            "select peak_mark from scorecard_outcomes where outcome_id = ?",
+            (outcome_id,),
+        ).fetchone()
+    return str(row["peak_mark"])
+
+
 def _seed_open_outcome_with_position(
     *,
     actor: str,
     mode: str,
     stop_loss: str,
     take_profit: str,
+    trailing_pct: str = "0",
+    peak_mark: str = "0",
 ) -> None:
     now = datetime.now(UTC).isoformat()
     scorecard_id = f"scorecard-{mode}"
@@ -3727,11 +3925,13 @@ def _seed_open_outcome_with_position(
               (outcome_id, scorecard_id, actor, symbol, source, action,
                opened_intent_id, opened_at, opened_qty, opened_avg_cost,
                opened_cost_basis, status, closed_at, closed_realized_pnl,
-               closed_return_pct, notes)
-            values (?,?,?,?,?,?,?,?,?,?,?,'open',NULL,NULL,NULL,NULL)
+               closed_return_pct, notes, trailing_pct, peak_mark)
+            values (?,?,?,?,?,?,?,?,?,?,?,'open',NULL,NULL,NULL,NULL,?,?)
             """,
             (
-                f"outcome-{mode}",
+                TRAILING_OUTCOME_ID
+                if mode == "paper"
+                else "11111111-1111-4111-8111-000000000002",
                 scorecard_id,
                 actor,
                 "BTCUSDT",
@@ -3742,6 +3942,8 @@ def _seed_open_outcome_with_position(
                 "0.00200000",
                 "100000.00000000",
                 "200.00000000",
+                trailing_pct,
+                peak_mark,
             ),
         )
         conn.commit()

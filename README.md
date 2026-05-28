@@ -45,6 +45,20 @@ curl -s http://127.0.0.1:8080/intents \
 
 Live trading is disabled in Phase 1. `mode="live"` is rejected before execution. The execution service only returns simulated fills from fixture market data. Exchange API keys are placeholders only and are not read by the services.
 
+## Phase 19 Trailing Stops
+
+Open scorecard outcomes now support `trailing_pct` and `peak_mark`. Use:
+
+```bash
+curl -s -X POST http://127.0.0.1:18081/scorecard-outcomes/<outcome_id>/trailing \
+  -H 'content-type: application/json' \
+  -d '{"trailing_pct":"0.05"}'
+```
+
+The stop-loss watchdog keeps `peak_mark` monotonic and fires a protective sell
+when the mark falls below the trailing floor. Static `stop_loss` remains active;
+whichever condition triggers first wins.
+
 
 ## Phase 2
 

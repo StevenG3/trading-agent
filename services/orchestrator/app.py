@@ -184,6 +184,12 @@ class NotificationSubscribeRequest(BaseModel):
     events: list[str] = PydanticField(default_factory=lambda: ["fill"])
 
 
+class TrailingStopUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    trailing_pct: str = PydanticField(min_length=1)
+
+
 class AutonomyUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -214,6 +220,7 @@ ScorecardCreateRequest.model_rebuild(_types_namespace={"Literal": Literal})
 ScorecardIntentRequest.model_rebuild(_types_namespace={"Literal": Literal, "UUID": UUID})
 LiveAutonomyUpdateRequest.model_rebuild()
 NotificationSubscribeRequest.model_rebuild()
+TrailingStopUpdateRequest.model_rebuild()
 AutonomyUpdateRequest.model_rebuild()
 WatchlistAddRequest.model_rebuild(_types_namespace={"Literal": Literal})
 LiveUnlockRequest.model_rebuild()
@@ -661,10 +668,21 @@ def _maybe_open_scorecard_outcome(
         return
     with connect() as conn:
         row = conn.execute(
-            "select source from scorecards where scorecard_id = ?",
+            "select source, payload_json from scorecards where scorecard_id = ?",
             (intent.source.scorecard_id,),
         ).fetchone()
     source = row["source"] if row else "unknown"
+    trailing_pct = "0"
+    if row is not None:
+        try:
+            payload = json.loads(str(row["payload_json"]))
+            metadata = payload.get("metadata") if isinstance(payload, dict) else None
+            if isinstance(metadata, dict) and metadata.get("trailing_pct") is not None:
+                tp = Decimal(str(metadata["trailing_pct"]))
+                if Decimal("0") < tp < Decimal("1"):
+                    trailing_pct = str(tp)
+        except (json.JSONDecodeError, InvalidOperation, ValueError):
+            pass
     opened_qty = _q8(execution.filled_qty)
     opened_avg_cost = _q8(execution.avg_price)
     opened_cost_basis = _q8(opened_qty * opened_avg_cost)
@@ -675,8 +693,8 @@ def _maybe_open_scorecard_outcome(
               (outcome_id, scorecard_id, actor, symbol, source, action,
                opened_intent_id, opened_at, opened_qty, opened_avg_cost,
                opened_cost_basis, status, closed_at, closed_realized_pnl,
-               closed_return_pct, notes)
-            values (?,?,?,?,?,?,?,?,?,?,?,'open',NULL,NULL,NULL,NULL)
+               closed_return_pct, notes, trailing_pct, peak_mark)
+            values (?,?,?,?,?,?,?,?,?,?,?,'open',NULL,NULL,NULL,NULL,?,?)
             """,
             (
                 str(uuid4()),
@@ -690,6 +708,8 @@ def _maybe_open_scorecard_outcome(
                 _q8s(opened_qty),
                 _q8s(opened_avg_cost),
                 _q8s(opened_cost_basis),
+                trailing_pct,
+                "0",
             ),
         )
         conn.commit()
@@ -742,7 +762,8 @@ def _load_outcome_for_reflection(outcome_id: str) -> dict[str, object] | None:
             "select outcome_id, scorecard_id, actor, symbol, source, action, "
             "opened_intent_id, opened_at, opened_qty, opened_avg_cost, "
             "opened_cost_basis, status, closed_at, closed_realized_pnl, "
-            "closed_return_pct, notes, reflected_at from scorecard_outcomes where outcome_id = ?",
+            "closed_return_pct, notes, reflected_at, trailing_pct, peak_mark "
+            "from scorecard_outcomes where outcome_id = ?",
             (outcome_id,),
         ).fetchone()
     if row is None:
@@ -1315,7 +1336,7 @@ def stop_loss_watchdog_tick(now: datetime | None = None) -> dict[str, int]:
         rows = conn.execute(
             """
             select o.outcome_id, o.scorecard_id, o.actor, o.symbol, o.opened_intent_id,
-                   o.opened_qty, s.payload_json
+                   o.opened_qty, o.trailing_pct, o.peak_mark, s.payload_json
             from scorecard_outcomes o
             join scorecards s on s.scorecard_id = o.scorecard_id
             where o.status = 'open'
@@ -1337,20 +1358,31 @@ def stop_loss_watchdog_tick(now: datetime | None = None) -> dict[str, int]:
                 continue
             stop_loss = _optional_decimal(payload.get("stop_loss"))
             take_profit = _optional_decimal(payload.get("take_profit"))
-            if stop_loss is None and take_profit is None:
+            trailing_pct = _optional_decimal(row["trailing_pct"])
+            trailing_enabled = trailing_pct is not None and trailing_pct > 0
+            if stop_loss is None and take_profit is None and not trailing_enabled:
                 skipped += 1
                 continue
             mark, _source = _mark_for_symbol(str(row["symbol"]))
             if mark is None:
                 skipped += 1
                 continue
-            should_sell = (stop_loss is not None and mark <= stop_loss) or (
+            peak = _peak_for_row(row)
+            if mark > peak:
+                peak = mark
+                _update_peak_mark(str(row["outcome_id"]), peak)
+            should_sell_static = (stop_loss is not None and mark <= stop_loss) or (
                 take_profit is not None and mark >= take_profit
             )
-            if not should_sell:
+            should_sell_trailing = False
+            if trailing_enabled and peak > 0 and trailing_pct is not None:
+                trailing_floor = peak * (Decimal("1") - trailing_pct)
+                should_sell_trailing = mark < trailing_floor
+            if not (should_sell_static or should_sell_trailing):
                 skipped += 1
                 continue
-            if _fire_protective_sell(row):
+            reason = "trailing" if should_sell_trailing and not should_sell_static else "static"
+            if _fire_protective_sell(row, reason=reason):
                 fired += 1
             else:
                 failed += 1
@@ -1368,7 +1400,23 @@ def _optional_decimal(value: object) -> Decimal | None:
         return None
 
 
-def _fire_protective_sell(row: sqlite3.Row) -> bool:
+def _peak_for_row(row: sqlite3.Row) -> Decimal:
+    try:
+        return Decimal(str(row["peak_mark"] or "0"))
+    except (InvalidOperation, ValueError):
+        return Decimal("0")
+
+
+def _update_peak_mark(outcome_id: str, peak: Decimal) -> None:
+    with connect() as conn:
+        conn.execute(
+            "update scorecard_outcomes set peak_mark = ? where outcome_id = ?",
+            (str(peak), outcome_id),
+        )
+        conn.commit()
+
+
+def _fire_protective_sell(row: sqlite3.Row, *, reason: str = "static") -> bool:
     actor = str(row["actor"])
     symbol = str(row["symbol"])
     opened_intent_id = str(row["opened_intent_id"])
@@ -1380,7 +1428,7 @@ def _fire_protective_sell(row: sqlite3.Row) -> bool:
     payload: dict[str, object] = {
         "intent_id": str(intent_id),
         "request_id": str(uuid4()),
-        "idempotency_key": f"protective-{row['outcome_id']}-{int(time.time())}",
+        "idempotency_key": f"protective-{row['outcome_id']}-{reason}-{int(time.time())}",
         "actor": actor,
         "created_at": _now().isoformat(),
         "mode": mode,
@@ -2332,7 +2380,7 @@ def list_outcomes(
             select outcome_id, scorecard_id, actor, symbol, source, action,
                    opened_intent_id, opened_at, opened_qty, opened_avg_cost,
                    opened_cost_basis, status, closed_at, closed_realized_pnl,
-                   closed_return_pct, notes, reflected_at
+                   closed_return_pct, notes, reflected_at, trailing_pct, peak_mark
             from scorecard_outcomes{where}
             order by opened_at desc
             limit ?
@@ -2434,7 +2482,8 @@ def reflect_pending(limit: int = Query(default=50, ge=1, le=500)) -> dict[str, o
             "select outcome_id, scorecard_id, actor, symbol, source, action, "
             "opened_intent_id, opened_at, opened_qty, opened_avg_cost, "
             "opened_cost_basis, status, closed_at, closed_realized_pnl, "
-            "closed_return_pct, notes, reflected_at from scorecard_outcomes "
+            "closed_return_pct, notes, reflected_at, trailing_pct, peak_mark "
+            "from scorecard_outcomes "
             "where status = 'closed' and reflected_at is null "
             "order by closed_at asc limit ?",
             (limit,),
@@ -2460,12 +2509,35 @@ def get_outcome(outcome_id: UUID) -> JSONResponse | dict[str, object]:
             "select outcome_id, scorecard_id, actor, symbol, source, action, "
             "opened_intent_id, opened_at, opened_qty, opened_avg_cost, "
             "opened_cost_basis, status, closed_at, closed_realized_pnl, "
-            "closed_return_pct, notes, reflected_at from scorecard_outcomes where outcome_id = ?",
+            "closed_return_pct, notes, reflected_at, trailing_pct, peak_mark "
+            "from scorecard_outcomes where outcome_id = ?",
             (str(outcome_id),),
         ).fetchone()
     if row is None:
         return JSONResponse(status_code=404, content={"code": "OUTCOME_NOT_FOUND"})
     return _outcome_row_to_dict(row)
+
+
+@app.post("/scorecard-outcomes/{outcome_id}/trailing", response_model=None)
+def update_outcome_trailing(
+    outcome_id: UUID, req: TrailingStopUpdateRequest
+) -> JSONResponse | dict[str, object]:
+    try:
+        trailing_pct = Decimal(req.trailing_pct)
+    except (InvalidOperation, ValueError):
+        return JSONResponse(status_code=400, content={"code": "INVALID_TRAILING_PCT"})
+    if trailing_pct < 0 or trailing_pct >= 1:
+        return JSONResponse(status_code=400, content={"code": "TRAILING_PCT_OUT_OF_RANGE"})
+    with connect() as conn:
+        cursor = conn.execute(
+            "update scorecard_outcomes set trailing_pct = ? "
+            "where outcome_id = ? and status = 'open'",
+            (str(trailing_pct), str(outcome_id)),
+        )
+        conn.commit()
+    if cursor.rowcount == 0:
+        return JSONResponse(status_code=404, content={"code": "OUTCOME_NOT_FOUND_OR_NOT_OPEN"})
+    return {"outcome_id": str(outcome_id), "trailing_pct": str(trailing_pct)}
 
 
 def _outcome_row_to_dict(row: sqlite3.Row) -> dict[str, object]:
@@ -2487,6 +2559,8 @@ def _outcome_row_to_dict(row: sqlite3.Row) -> dict[str, object]:
         "closed_return_pct": row["closed_return_pct"],
         "notes": row["notes"],
         "reflected_at": row["reflected_at"],
+        "trailing_pct": row["trailing_pct"],
+        "peak_mark": row["peak_mark"],
     }
 
 
