@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import importlib.util
 import json
 import sqlite3
@@ -71,8 +73,9 @@ def claude_response(
 
 
 class FakeResponse:
-    def __init__(self, payload: dict[str, object]) -> None:
+    def __init__(self, payload: dict[str, object], status_code: int = 200) -> None:
         self._payload = payload
+        self.status_code = status_code
 
     def raise_for_status(self) -> None:
         return None
@@ -3190,7 +3193,7 @@ def test_live_autonomy_settings_default_and_validation(monkeypatch, tmp_path: Pa
 
 def test_auto_unlock_token_single_use_actor_and_expiry(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
-    token = orchestrator_app._mint_auto_unlock_unbound_token("tg_1")
+    token = orchestrator_app._mint_user_live_unlock_token("tg_1")
     assert (
         orchestrator_app._consume_live_unlock_or_error(token, "tg_2", dry=True).status_code == 403
     )
@@ -3199,7 +3202,7 @@ def test_auto_unlock_token_single_use_actor_and_expiry(monkeypatch, tmp_path: Pa
         orchestrator_app._consume_live_unlock_or_error(token, "tg_1", dry=False).status_code == 403
     )
     with orchestrator_app.connect() as conn:
-        expired = orchestrator_app._mint_auto_unlock_unbound_token("tg_1")
+        expired = orchestrator_app._mint_user_live_unlock_token("tg_1")
         conn.execute(
             "update live_unlock_tokens set expires_at = ? where token = ?",
             ("2000-01-01T00:00:00+00:00", expired),
@@ -3208,6 +3211,261 @@ def test_auto_unlock_token_single_use_actor_and_expiry(monkeypatch, tmp_path: Pa
     assert (
         orchestrator_app._consume_live_unlock_or_error(expired, "tg_1", dry=True).status_code == 410
     )
+
+
+def test_auto_unlock_token_bound_to_intent(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    intent_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    other_intent_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+    token = orchestrator_app._mint_auto_unlock_bound_token("tg_1", intent_id)
+
+    mismatch = orchestrator_app._consume_live_unlock_or_error(
+        token, "tg_1", dry=True, intent_id=orchestrator_app.UUID(other_intent_id)
+    )
+    assert mismatch.status_code == 403
+    assert mismatch.body == b'{"code":"LIVE_UNLOCK_INTENT_MISMATCH"}'
+    assert (
+        orchestrator_app._consume_live_unlock_or_error(
+            token, "tg_1", dry=False, intent_id=orchestrator_app.UUID(intent_id)
+        )
+        is None
+    )
+
+
+def test_create_intent_from_scorecard_respects_requested_intent_id(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    client = TestClient(orchestrator_app.app)
+    scorecard_id = client.post("/scorecards", json=make_scorecard_payload(actor="tg_1")).json()[
+        "scorecard_id"
+    ]
+    requested_intent = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+    monkeypatch.setattr(
+        orchestrator_app.httpx,
+        "post",
+        lambda url, **kw: FakeResponse(
+            decision(intent_id=requested_intent)
+            if url.endswith("/validate")
+            else execution(intent_id=requested_intent)
+        ),
+    )
+    response = client.post(
+        "/intents/from_scorecard",
+        json={
+            "scorecard_id": scorecard_id,
+            "actor": "tg_1",
+            "idempotency_key": "scorecard-bound-intent",
+            "mode": "paper",
+            "usdt_budget": "100",
+            "intent_id": requested_intent,
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["intent"]["intent_id"] == requested_intent
+
+
+def test_live_auto_mints_intent_bound_unlock(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    captured: dict[str, object] = {}
+
+    def fake_post(url: str, **kwargs: object) -> FakeResponse:
+        captured["json"] = kwargs["json"]
+        captured["headers"] = kwargs["headers"]
+        return FakeResponse({"status": "executed"})
+
+    monkeypatch.setattr(orchestrator_app.httpx, "post", fake_post)
+
+    assert orchestrator_app._fire_live_autonomous_trade("tg_1", "scorecard-abc", Decimal("25"))
+    payload = captured["json"]
+    headers = captured["headers"]
+    assert isinstance(payload, dict)
+    assert isinstance(headers, dict)
+    assert payload["mode"] == "live"
+    assert payload["intent_id"]
+    token = headers["x-live-unlock"]
+    with orchestrator_app.connect() as conn:
+        row = conn.execute(
+            "select actor, bound_intent_id from live_unlock_tokens where token = ?",
+            (token,),
+        ).fetchone()
+    assert row["actor"] == "tg_1"
+    assert row["bound_intent_id"] == payload["intent_id"]
+
+
+def test_live_exposure_cap_defaults_closed_and_blocks_breach(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(orchestrator_app, "LIVE_AUTONOMY_GLOBAL_ENABLED", True)
+    settings = {
+        "enabled": True,
+        "allowed_sources": "tradingagents",
+        "min_calibrated_conviction": "0.70",
+        "min_closed_outcomes": 5,
+        "daily_live_budget_usdt": "1000",
+        "per_live_trade_max_usdt": "25",
+        "daily_live_trade_count_max": 3,
+    }
+    scorecard = {
+        "source": "tradingagents",
+        "conviction": "0.9",
+        "metadata": {"asset_type": "crypto", "heuristic_conviction": "0.9"},
+    }
+    with orchestrator_app.connect() as conn:
+        conn.execute(
+            "insert into conviction_calibration values (?,?,?,?,?,?,?,?,?)",
+            ("tradingagents", "crypto", "0.90-1.01", 5, 5, "0", "1", "0.9", "now"),
+        )
+        conn.commit()
+
+    allowed, reason = orchestrator_app._eligible_for_live_auto("tg_1", scorecard, settings)
+    assert allowed is False
+    assert reason == "MAX_LIVE_EXPOSURE_NOT_SET"
+
+    settings["max_live_exposure_usdt"] = "100"
+    with orchestrator_app.connect() as conn:
+        conn.execute(
+            "insert into paper_positions values (?,?,?,?,?,?,?)",
+            ("tg_1", "BTCUSDT", "0.001", "90000", "90", "0", "now"),
+        )
+        conn.execute(
+            "insert into intents (intent_id, payload_json, created_at, status, idempotency_key) "
+            "values (?,?,?,?,?)",
+            (
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                json.dumps({"actor": "tg_1", "symbol": "BTCUSDT", "mode": "live"}),
+                "now",
+                "executed",
+                "live-exposure-existing",
+            ),
+        )
+        conn.commit()
+    allowed, reason = orchestrator_app._eligible_for_live_auto("tg_1", scorecard, settings)
+    assert allowed is False
+    assert reason == "LIVE_EXPOSURE_CAP_BREACHED:90.00000000/100"
+
+
+def test_live_autonomy_settings_include_exposure_cap(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    client = TestClient(orchestrator_app.app)
+    assert (
+        client.post(
+            "/live-autonomy/settings",
+            json={"actor": "tg_1", "max_live_exposure_usdt": "-1"},
+        ).json()["code"]
+        == "INVALID_MAX_EXPOSURE"
+    )
+    saved = client.post(
+        "/live-autonomy/settings",
+        json={"actor": "tg_1", "max_live_exposure_usdt": "250"},
+    ).json()
+    assert saved["max_live_exposure_usdt"] == "250"
+    loaded = client.get("/live-autonomy/settings", params={"actor": "tg_1"}).json()
+    assert loaded["max_live_exposure_usdt"] == "250"
+    assert loaded["current_live_exposure_usdt"] == "0"
+
+
+def test_notification_subscribe_sends_hmac_fill_and_records_delivery(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        orchestrator_app, "NOTIFICATION_HOST_ALLOWLIST", frozenset({"hermes-agent"})
+    )
+    client = TestClient(orchestrator_app.app)
+    subscribed = client.post(
+        "/notifications/subscribe",
+        json={
+            "actor": "tg_1",
+            "webhook_url": "http://hermes-agent:9090/trading/fill",
+            "events": ["fill"],
+        },
+    )
+    assert subscribed.status_code == 200
+    secret = subscribed.json()["secret"]
+    calls: list[dict[str, object]] = []
+
+    def fake_post(url: str, **kwargs: object) -> FakeResponse:
+        if url == "http://hermes-agent:9090/trading/fill":
+            calls.append(kwargs)
+            return FakeResponse({"ok": True}, status_code=204)
+        if url.endswith("/validate"):
+            return FakeResponse(decision())
+        return FakeResponse(execution())
+
+    monkeypatch.setattr(orchestrator_app.httpx, "post", fake_post)
+    created = client.post("/intents", json={**VALID, "actor": "tg_1", "idempotency_key": "fill-1"})
+    assert created.status_code == 200
+    assert len(calls) == 1
+    sent = calls[0]
+    body = sent["content"]
+    headers = sent["headers"]
+    assert isinstance(body, str)
+    assert isinstance(headers, dict)
+    payload = json.loads(body)
+    assert set(payload) == {
+        "event_type",
+        "actor",
+        "symbol",
+        "side",
+        "qty_str",
+        "avg_price_str",
+        "mode",
+        "status",
+        "intent_id",
+    }
+    expected = hmac.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
+    assert headers["x-trading-agent-signature"] == expected
+    deliveries = client.get("/notifications/deliveries", params={"actor": "tg_1"}).json()
+    assert deliveries["deliveries"][0]["ok"] is True
+    assert deliveries["deliveries"][0]["status_code"] == 204
+
+
+def test_notification_rejects_disallowed_host_and_prunes_history(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(orchestrator_app, "NOTIFICATION_HOST_ALLOWLIST", frozenset({"allowed"}))
+    monkeypatch.setattr(orchestrator_app, "NOTIFICATION_HISTORY_LIMIT", 2)
+    client = TestClient(orchestrator_app.app)
+    rejected = client.post(
+        "/notifications/subscribe",
+        json={"actor": "tg_1", "webhook_url": "http://evil.example/hook", "events": ["fill"]},
+    )
+    assert rejected.status_code == 400
+    assert rejected.json()["code"] == "WEBHOOK_HOST_NOT_ALLOWED"
+
+    assert (
+        client.post(
+            "/notifications/subscribe",
+            json={"actor": "tg_1", "webhook_url": "http://allowed/hook", "events": ["fill"]},
+        ).status_code
+        == 200
+    )
+
+    def fake_post(url: str, **kwargs: object) -> FakeResponse:
+        if url == "http://allowed/hook":
+            return FakeResponse({"ok": True}, status_code=500)
+        if url.endswith("/validate"):
+            return FakeResponse(decision())
+        return FakeResponse(execution())
+
+    monkeypatch.setattr(orchestrator_app.httpx, "post", fake_post)
+    for index in range(3):
+        body = {
+            **VALID,
+            "intent_id": f"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa{index}",
+            "actor": "tg_1",
+            "idempotency_key": f"fill-prune-{index}",
+        }
+        response = client.post("/intents", json=body)
+        assert response.status_code == 200
+    deliveries = client.get("/notifications/deliveries", params={"actor": "tg_1"}).json()
+    assert len(deliveries["deliveries"]) == 2
+    assert deliveries["deliveries"][0]["ok"] is False
 
 
 def test_disable_and_enable_live_autonomy_kill_switch(monkeypatch, tmp_path: Path) -> None:

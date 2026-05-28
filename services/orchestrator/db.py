@@ -203,6 +203,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             enabled integer not null default 0,
             daily_live_budget_usdt text not null default '0',
             per_live_trade_max_usdt text not null default '50',
+            max_live_exposure_usdt text not null default '0',
             daily_live_trade_count_max integer not null default 3,
             min_calibrated_conviction text not null default '0.70',
             min_closed_outcomes integer not null default 20,
@@ -212,6 +213,14 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    try:
+        conn.execute(
+            "alter table live_autonomy_settings "
+            "add column max_live_exposure_usdt text not null default '0'"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
     conn.execute(
         """
         create table if not exists live_autonomy_spend (
@@ -235,6 +244,37 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("insert or ignore into live_autonomy_kill (id, killed) values (1, 0)")
+    conn.execute(
+        """
+        create table if not exists notification_subscriptions (
+            actor text primary key,
+            webhook_url text not null,
+            secret text not null,
+            events_json text not null,
+            enabled integer not null default 1,
+            created_at text not null,
+            updated_at text not null
+        )
+        """
+    )
+    conn.execute(
+        """
+        create table if not exists notification_deliveries (
+            id integer primary key autoincrement,
+            actor text not null,
+            event_type text not null,
+            webhook_url text not null,
+            status_code integer,
+            ok integer not null,
+            error_class text,
+            created_at text not null
+        )
+        """
+    )
+    conn.execute(
+        "create index if not exists idx_notification_deliveries_actor_created "
+        "on notification_deliveries(actor, created_at desc)"
+    )
     conn.execute(
         """
         create table if not exists scorecard_outcomes (
