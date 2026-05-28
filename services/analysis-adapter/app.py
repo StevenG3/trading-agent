@@ -20,6 +20,7 @@ app = FastAPI(title="analysis-adapter", version="0.1.0")
 
 TA_BRIDGE_URL = os.getenv("TA_BRIDGE_URL", "http://tradingagents-bridge:18181")
 ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "http://orchestrator:8080")
+MARKET_DATA_URL = os.getenv("MARKET_DATA_URL", "http://market-data:8083")
 TA_DEFAULT_PROVIDER = os.getenv("TA_DEFAULT_PROVIDER", "deepseek")
 TA_TIMEOUT_SEC = float(os.getenv("TA_TIMEOUT_SEC", "900"))
 SCORECARD_TTL_MIN = int(os.getenv("ANALYSIS_SCORECARD_TTL_MIN", "60"))
@@ -44,6 +45,7 @@ CRYPTO_NAME_TO_SYMBOL = {
     "ada": "ADA",
 }
 QUOTE_ASSETS = ("USDT", "USDC", "USD", "BUSD")
+BENCHMARK_FOR_ASSET = {"crypto": "BTCUSDT", "stock": "SPY"}
 
 
 RESEARCH_RATING_TO_DECISION = {
@@ -72,6 +74,7 @@ def _decision_from_research_rating(value: str) -> str | None:
             return decision
     return None
 
+
 def _normalize_ta_ticker(symbol: str, asset_type: str) -> str:
     """Convert user/trading crypto symbols to TradingAgents-friendly tickers."""
     cleaned = symbol.strip()
@@ -90,7 +93,6 @@ def _normalize_ta_ticker(symbol: str, asset_type: str) -> str:
     return f"{base}-USD"
 
 
-
 def _canonical_crypto_symbol(symbol: str, asset_type: str) -> str:
     cleaned = symbol.strip()
     if asset_type != "crypto":
@@ -106,6 +108,23 @@ def _canonical_crypto_symbol(symbol: str, asset_type: str) -> str:
     if base.endswith("USD"):
         base = base[:-3]
     return f"{base}USDT"
+
+
+def _benchmark_for(asset_type: str) -> str:
+    return BENCHMARK_FOR_ASSET.get(asset_type, "SPY")
+
+
+def _fetch_benchmark_price(symbol: str) -> str | None:
+    try:
+        response = httpx.get(
+            f"{MARKET_DATA_URL.rstrip('/')}/ticker", params={"symbol": symbol}, timeout=3.0
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return str(payload["price"])
+    except (httpx.HTTPError, KeyError, ValueError):
+        return None
+
 
 def _default_analysts() -> list[AnalystName]:
     return ["market", "news"]
@@ -162,9 +181,7 @@ def readyz() -> dict[str, str]:
 
 @app.post("/analyze", response_model=None)
 def analyze(req: AnalyzeRequest) -> dict[str, object]:
-    req = req.model_copy(
-        update={"symbol": _canonical_crypto_symbol(req.symbol, req.asset_type)}
-    )
+    req = req.model_copy(update={"symbol": _canonical_crypto_symbol(req.symbol, req.asset_type)})
     job_id = str(uuid4())
     requested_at = _now().isoformat()
     with connect() as conn:
@@ -353,6 +370,14 @@ def _translate_to_scorecard_payload(
     metadata["ta_ticker"] = str(
         raw.get("ticker") or _normalize_ta_ticker(req.symbol, req.asset_type)
     )
+    benchmark_symbol = _benchmark_for(req.asset_type)
+    if benchmark_symbol.upper() == req.symbol.upper():
+        metadata["benchmark_symbol"] = "self"
+    else:
+        metadata["benchmark_symbol"] = benchmark_symbol
+        benchmark_open_price = _fetch_benchmark_price(benchmark_symbol)
+        if benchmark_open_price is not None:
+            metadata["benchmark_open_price"] = benchmark_open_price
 
     thesis_parts: list[str] = []
     if isinstance(reports.get("market"), str):

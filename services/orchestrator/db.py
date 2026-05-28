@@ -85,7 +85,6 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.execute(
         "create index if not exists idx_daily_fills_date_symbol on daily_fills(date, symbol)"
     )
-
     conn.execute(
         """
         create table if not exists scorecards (
@@ -136,7 +135,25 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.execute(
         "create index if not exists idx_live_unlock_expires on live_unlock_tokens(expires_at)"
     )
-
+    conn.execute(
+        """
+        create table if not exists watchlist_entries (
+            actor text not null,
+            symbol text not null,
+            asset_type text not null,
+            cadence_minutes integer not null,
+            last_run_at text,
+            next_run_at text not null,
+            enabled integer not null default 1,
+            created_at text not null,
+            primary key (actor, symbol)
+        )
+        """
+    )
+    conn.execute(
+        "create index if not exists idx_watchlist_due "
+        "on watchlist_entries(enabled, next_run_at)"
+    )
     conn.execute(
         """
         create table if not exists scorecard_outcomes (

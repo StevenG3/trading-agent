@@ -2078,6 +2078,7 @@ def test_get_pnl_today_includes_unrealized_marks(monkeypatch, tmp_path: Path) ->
     assert body["unrealized_pnl"] == "50.00000000"
     assert body["total_pnl"] == "50.00000000"
 
+
 # -- Phase 10 debt fixes -----------------------------------------------------
 
 
@@ -2112,9 +2113,7 @@ def test_from_nl_live_requires_unlock_token(monkeypatch, tmp_path: Path) -> None
     assert no_tok.status_code == 403
     assert no_tok.json()["code"] == "LIVE_UNLOCK_REQUIRED"
 
-    with_tok = client.post(
-        "/intents/from_nl", json=payload, headers={"x-live-unlock": token}
-    )
+    with_tok = client.post("/intents/from_nl", json=payload, headers={"x-live-unlock": token})
     assert with_tok.status_code == 200
 
 
@@ -2125,9 +2124,7 @@ def test_from_scorecard_consume_is_conditional_update(monkeypatch, tmp_path: Pat
         orchestrator_app.httpx,
         "post",
         lambda url, **k: (
-            FakeResponse(decision())
-            if url.endswith("/validate")
-            else FakeResponse(execution())
+            FakeResponse(decision()) if url.endswith("/validate") else FakeResponse(execution())
         ),
     )
     monkeypatch.setattr(orchestrator_app.httpx, "get", lambda *a, **k: FakePriceResponse())
@@ -2167,9 +2164,7 @@ def test_scorecard_race_rowcount_returns_409(monkeypatch, tmp_path: Path) -> Non
         orchestrator_app.httpx,
         "post",
         lambda url, **k: (
-            FakeResponse(decision())
-            if url.endswith("/validate")
-            else FakeResponse(execution())
+            FakeResponse(decision()) if url.endswith("/validate") else FakeResponse(execution())
         ),
     )
     client = TestClient(orchestrator_app.app)
@@ -2239,7 +2234,6 @@ def test_live_unlock_wet_rowcount_zero_returns_used(monkeypatch, tmp_path: Path)
     assert err is not None
     body = json.loads(bytes(err.body).decode())
     assert body["code"] == "LIVE_UNLOCK_ALREADY_USED"
-
 
 
 # -- Phase 12 scorecard outcomes ---------------------------------------------
@@ -2472,9 +2466,11 @@ def test_outcomes_summary_hit_rate(monkeypatch, tmp_path: Path) -> None:
         )
         conn.commit()
 
-    stats = TestClient(orchestrator_app.app).get(
-        "/scorecard-outcomes/summary", params={"actor": "user_1"}
-    ).json()["by_source"]["tradingagents"]
+    stats = (
+        TestClient(orchestrator_app.app)
+        .get("/scorecard-outcomes/summary", params={"actor": "user_1"})
+        .json()["by_source"]["tradingagents"]
+    )
 
     assert stats["closed_count"] == 3
     assert stats["hits"] == 2
@@ -2611,10 +2607,22 @@ def test_reflect_pending_endpoint_retries_closed_unreflected(monkeypatch, tmp_pa
             "closed_at, closed_realized_pnl, closed_return_pct, notes, reflected_at) "
             "values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)",
             (
-                str(orchestrator_app.uuid4()), "sc-rp", "user_1", "BTCUSDT",
-                "tradingagents", "buy", "intent-rp", now, "0.00100000",
-                "100000.00000000", "100.00000000", "closed", now, "10.00000000",
-                "0.10000000", None,
+                str(orchestrator_app.uuid4()),
+                "sc-rp",
+                "user_1",
+                "BTCUSDT",
+                "tradingagents",
+                "buy",
+                "intent-rp",
+                now,
+                "0.00100000",
+                "100000.00000000",
+                "100.00000000",
+                "closed",
+                now,
+                "10.00000000",
+                "0.10000000",
+                None,
             ),
         )
         conn.commit()
@@ -2652,15 +2660,180 @@ def test_outcomes_summary_includes_pending_reflection_count(monkeypatch, tmp_pat
                 "closed_at, closed_realized_pnl, closed_return_pct, notes, reflected_at) "
                 "values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
-                    str(orchestrator_app.uuid4()), f"sc-pr-{i}", "user_1", "BTCUSDT",
-                    "tradingagents", "buy", f"intent-pr-{i}", now, "0.00100000",
-                    "100000.00000000", "100.00000000", "closed", now, "5.00000000",
-                    "0.05000000", None, reflected,
+                    str(orchestrator_app.uuid4()),
+                    f"sc-pr-{i}",
+                    "user_1",
+                    "BTCUSDT",
+                    "tradingagents",
+                    "buy",
+                    f"intent-pr-{i}",
+                    now,
+                    "0.00100000",
+                    "100000.00000000",
+                    "100.00000000",
+                    "closed",
+                    now,
+                    "5.00000000",
+                    "0.05000000",
+                    None,
+                    reflected,
                 ),
             )
         conn.commit()
 
-    stats = TestClient(orchestrator_app.app).get(
-        "/scorecard-outcomes/summary", params={"actor": "user_1"}
-    ).json()["by_source"]["tradingagents"]
+    stats = (
+        TestClient(orchestrator_app.app)
+        .get("/scorecard-outcomes/summary", params={"actor": "user_1"})
+        .json()["by_source"]["tradingagents"]
+    )
     assert stats["pending_reflection_count"] == 1
+
+
+def _insert_scorecard_for_reflection(tmp_path: Path, metadata: dict[str, str]) -> str:
+    import uuid
+
+    _ = tmp_path
+    scorecard_id = str(uuid.uuid4())
+    with orchestrator_app.connect() as conn:
+        conn.execute(
+            "insert into scorecards "
+            "(scorecard_id, actor, symbol, action, source, payload_json, created_at, expires_at) "
+            "values (?,?,?,?,?,?,?,?)",
+            (
+                scorecard_id,
+                "tg_1",
+                "ETHUSDT",
+                "buy",
+                "tradingagents",
+                json.dumps({"metadata": metadata}),
+                "2026-05-25T00:00:00+00:00",
+                "2026-05-25T01:00:00+00:00",
+            ),
+        )
+        conn.commit()
+    return scorecard_id
+
+
+def test_reflection_alpha_subtracts_benchmark_return(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    scorecard_id = _insert_scorecard_for_reflection(
+        tmp_path,
+        {
+            "ta_ticker": "ETH-USD",
+            "ta_date": "2026-05-25",
+            "benchmark_symbol": "BTCUSDT",
+            "benchmark_open_price": "100.00",
+        },
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        orchestrator_app, "_mark_for_symbol_str", lambda symbol: (Decimal("110.00"), "test")
+    )
+
+    def fake_post(url: str, **kwargs: object) -> FakeResponse:
+        captured.update(kwargs.get("json") or {})
+        return FakeResponse({"ok": True, "reflected": True})
+
+    monkeypatch.setattr(orchestrator_app.httpx, "post", fake_post)
+    assert (
+        orchestrator_app._push_outcome_reflection(
+            {
+                "scorecard_id": scorecard_id,
+                "symbol": "ETHUSDT",
+                "opened_at": "2026-05-25T00:00:00+00:00",
+                "closed_at": "2026-05-26T00:00:00+00:00",
+                "closed_return_pct": "0.25000000",
+            }
+        )
+        is True
+    )
+    assert captured["raw_return"] == "0.25000000"
+    assert captured["alpha_return"] == "0.15000000"
+    assert captured["benchmark_name"] == "BTCUSDT"
+    assert "alpha_note" not in captured
+
+
+def test_reflection_alpha_falls_back_for_self_benchmark(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    scorecard_id = _insert_scorecard_for_reflection(
+        tmp_path,
+        {"benchmark_symbol": "self", "benchmark_open_price": "100.00"},
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        orchestrator_app,
+        "_mark_for_symbol_str",
+        lambda symbol: (_ for _ in ()).throw(AssertionError("should not fetch self benchmark")),
+    )
+
+    def fake_post(url: str, **kwargs: object) -> FakeResponse:
+        captured.update(kwargs.get("json") or {})
+        return FakeResponse({"ok": True, "reflected": True})
+
+    monkeypatch.setattr(orchestrator_app.httpx, "post", fake_post)
+    assert (
+        orchestrator_app._push_outcome_reflection(
+            {"scorecard_id": scorecard_id, "symbol": "BTCUSDT", "closed_return_pct": "0.07000000"}
+        )
+        is True
+    )
+    assert captured["alpha_return"] == "0.07000000"
+    assert "alpha_note" in captured
+
+
+def test_watchlist_crud(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    client = TestClient(orchestrator_app.app)
+
+    created = client.post(
+        "/watchlist",
+        json={"actor": "tg_1", "symbol": "ETHUSDT", "asset_type": "crypto", "cadence_minutes": 30},
+    )
+    assert created.status_code == 200
+    assert created.json()["item"]["symbol"] == "ETHUSDT"
+
+    listed = client.get("/watchlist", params={"actor": "tg_1"})
+    assert listed.status_code == 200
+    assert listed.json()["items"][0]["cadence_minutes"] == 30
+
+    deleted = client.delete("/watchlist/ETHUSDT", params={"actor": "tg_1"})
+    assert deleted.status_code == 200
+    assert deleted.json() == {"deleted": True}
+    assert client.get("/watchlist", params={"actor": "tg_1"}).json()["items"] == []
+
+
+def test_scheduler_tick_fires_due_watchlist_and_reschedules(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    now = datetime(2026, 5, 25, 0, 0, tzinfo=UTC)
+    with orchestrator_app.connect() as conn:
+        conn.execute(
+            "insert into watchlist_entries "
+            "(actor, symbol, asset_type, cadence_minutes, last_run_at, "
+            "next_run_at, enabled, created_at) "
+            "values (?,?,?,?,NULL,?,?,?)",
+            (
+                "tg_1",
+                "ETHUSDT",
+                "crypto",
+                15,
+                "2026-05-24T23:59:00+00:00",
+                1,
+                "2026-05-24T00:00:00+00:00",
+            ),
+        )
+        conn.commit()
+    fired: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        orchestrator_app,
+        "_fire_scheduled_analysis",
+        lambda actor, symbol, asset_type: fired.append((actor, symbol, asset_type)) or True,
+    )
+
+    assert orchestrator_app.scheduler_tick(now=now) == {"due": 1, "fired": 1, "failed": 0}
+    assert fired == [("tg_1", "ETHUSDT", "crypto")]
+    with orchestrator_app.connect() as conn:
+        row = conn.execute(
+            "select last_run_at, next_run_at from watchlist_entries where actor = ?", ("tg_1",)
+        ).fetchone()
+    assert row["last_run_at"] == now.isoformat()
+    assert row["next_run_at"] == (now + timedelta(minutes=15)).isoformat()

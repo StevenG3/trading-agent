@@ -84,53 +84,57 @@ def test_analyze_propagates_ta_decision_to_action(monkeypatch, tmp_path: Path) -
 
     def fake_post(url: str, **kwargs: object) -> FakeResponse:
         if url.endswith("/analyze"):
-            return FakeResponse({
-                "ok": True,
-                "decision": "SELL",
-                "provider": "deepseek",
-                "reports": {"market": "bearish", "news": "negative"},
-            })
+            return FakeResponse(
+                {
+                    "ok": True,
+                    "decision": "SELL",
+                    "provider": "deepseek",
+                    "reports": {"market": "bearish", "news": "negative"},
+                }
+            )
         if url.endswith("/scorecards"):
             posted.update(kwargs.get("json") or {})
             return FakeResponse({"scorecard_id": str(uuid4())})
         raise AssertionError(url)
 
     monkeypatch.setattr(adapter_app.httpx, "post", fake_post)
-    job_id = TestClient(adapter_app.app).post(
-        "/analyze", json={"actor": "u", "symbol": "ETHUSDT"}
-    ).json()["job_id"]
+    job_id = (
+        TestClient(adapter_app.app)
+        .post("/analyze", json={"actor": "u", "symbol": "ETHUSDT"})
+        .json()["job_id"]
+    )
     _await_job(job_id, status="succeeded")
     assert posted["action"] == "sell"
     assert posted["source"] == "tradingagents"
     assert posted["conviction"] == "0.7000"
 
 
-
-
-def test_analyze_maps_research_rating_underweight_to_sell(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_analyze_maps_research_rating_underweight_to_sell(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     posted: dict[str, object] = {}
 
     def fake_post(url: str, **kwargs: object) -> FakeResponse:
         if url.endswith("/analyze"):
-            return FakeResponse({
-                "ok": True,
-                "decision": "Underweight",
-                "provider": "deepseek",
-                "final_trade_decision": "**Rating**: Underweight\nReduce BTC exposure by 20%.",
-                "reports": {"market": "weak momentum", "news": "ETF outflows"},
-            })
+            return FakeResponse(
+                {
+                    "ok": True,
+                    "decision": "Underweight",
+                    "provider": "deepseek",
+                    "final_trade_decision": "**Rating**: Underweight\nReduce BTC exposure by 20%.",
+                    "reports": {"market": "weak momentum", "news": "ETF outflows"},
+                }
+            )
         if url.endswith("/scorecards"):
             posted.update(kwargs.get("json") or {})
             return FakeResponse({"scorecard_id": str(uuid4())})
         raise AssertionError(url)
 
     monkeypatch.setattr(adapter_app.httpx, "post", fake_post)
-    job_id = TestClient(adapter_app.app).post(
-        "/analyze", json={"actor": "u", "symbol": "BTCUSDT"}
-    ).json()["job_id"]
+    job_id = (
+        TestClient(adapter_app.app)
+        .post("/analyze", json={"actor": "u", "symbol": "BTCUSDT"})
+        .json()["job_id"]
+    )
     _await_job(job_id, status="succeeded")
 
     assert posted["action"] == "sell"
@@ -149,6 +153,7 @@ def test_analyze_maps_research_rating_overweight_and_neutral() -> None:
     assert overweight["action"] == "buy"
     assert neutral["action"] == "hold"
 
+
 def test_crypto_symbol_normalization_sent_to_tradingagents_bridge(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -160,12 +165,14 @@ def test_crypto_symbol_normalization_sent_to_tradingagents_bridge(
             payload = kwargs.get("json") or {}
             assert isinstance(payload, dict)
             seen.append(str(payload["ticker"]))
-            return FakeResponse({
-                "ok": True,
-                "decision": "HOLD",
-                "provider": "deepseek",
-                "reports": {"market": "rangebound", "news": "quiet"},
-            })
+            return FakeResponse(
+                {
+                    "ok": True,
+                    "decision": "HOLD",
+                    "provider": "deepseek",
+                    "reports": {"market": "rangebound", "news": "quiet"},
+                }
+            )
         if url.endswith("/scorecards"):
             return FakeResponse({"scorecard_id": str(uuid4())})
         raise AssertionError(url)
@@ -173,9 +180,7 @@ def test_crypto_symbol_normalization_sent_to_tradingagents_bridge(
     monkeypatch.setattr(adapter_app.httpx, "post", fake_post)
     client = TestClient(adapter_app.app)
     for symbol in ["BTCUSDT", "BTC/USDT", "bitcoin"]:
-        job_id = client.post(
-            "/analyze", json={"actor": "u", "symbol": symbol}
-        ).json()["job_id"]
+        job_id = client.post("/analyze", json={"actor": "u", "symbol": symbol}).json()["job_id"]
         _await_job(job_id, status="succeeded")
 
     assert seen == ["BTC-USD", "BTC-USD", "BTC-USD"]
@@ -189,12 +194,14 @@ def test_crypto_natural_language_symbols_are_canonicalized_in_scorecards(
 
     def fake_post(url: str, **kwargs: object) -> FakeResponse:
         if url.endswith("/analyze"):
-            return FakeResponse({
-                "ok": True,
-                "decision": "HOLD",
-                "provider": "deepseek",
-                "reports": {"market": "rangebound", "news": "quiet"},
-            })
+            return FakeResponse(
+                {
+                    "ok": True,
+                    "decision": "HOLD",
+                    "provider": "deepseek",
+                    "reports": {"market": "rangebound", "news": "quiet"},
+                }
+            )
         if url.endswith("/scorecards"):
             payload = kwargs.get("json") or {}
             assert isinstance(payload, dict)
@@ -205,17 +212,13 @@ def test_crypto_natural_language_symbols_are_canonicalized_in_scorecards(
     monkeypatch.setattr(adapter_app.httpx, "post", fake_post)
     client = TestClient(adapter_app.app)
     for symbol in ["BTCUSDT", "BTC/USDT", "bitcoin"]:
-        job_id = client.post(
-            "/analyze", json={"actor": "u", "symbol": symbol}
-        ).json()["job_id"]
+        job_id = client.post("/analyze", json={"actor": "u", "symbol": symbol}).json()["job_id"]
         _await_job(job_id, status="succeeded")
 
     assert posted == ["BTCUSDT", "BTCUSDT", "BTCUSDT"]
 
 
-def test_failed_unparseable_ta_response_is_saved_for_diagnosis(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_failed_unparseable_ta_response_is_saved_for_diagnosis(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     raw = {"ok": True, "decision": "PROBABLY", "final_trade_decision": "unclear"}
 
@@ -225,9 +228,11 @@ def test_failed_unparseable_ta_response_is_saved_for_diagnosis(
         raise AssertionError(url)
 
     monkeypatch.setattr(adapter_app.httpx, "post", fake_post)
-    job_id = TestClient(adapter_app.app).post(
-        "/analyze", json={"actor": "u", "symbol": "BTCUSDT"}
-    ).json()["job_id"]
+    job_id = (
+        TestClient(adapter_app.app)
+        .post("/analyze", json={"actor": "u", "symbol": "BTCUSDT"})
+        .json()["job_id"]
+    )
     _await_job(job_id, status="failed")
 
     with adapter_app.connect() as conn:
@@ -236,6 +241,7 @@ def test_failed_unparseable_ta_response_is_saved_for_diagnosis(
         ).fetchone()
     assert row is not None
     assert row["raw_response_json"] == adapter_app.json.dumps(raw, default=str)
+
 
 def test_analyze_ta_failure_marks_job_failed(monkeypatch, tmp_path: Path) -> None:
     import httpx as _httpx
@@ -248,9 +254,11 @@ def test_analyze_ta_failure_marks_job_failed(monkeypatch, tmp_path: Path) -> Non
         raise AssertionError(url)
 
     monkeypatch.setattr(adapter_app.httpx, "post", fake_post)
-    job_id = TestClient(adapter_app.app).post(
-        "/analyze", json={"actor": "u", "symbol": "BTCUSDT"}
-    ).json()["job_id"]
+    job_id = (
+        TestClient(adapter_app.app)
+        .post("/analyze", json={"actor": "u", "symbol": "BTCUSDT"})
+        .json()["job_id"]
+    )
     _await_job(job_id, status="failed")
     job = TestClient(adapter_app.app).get(f"/jobs/{job_id}").json()
     assert "connection refused" in job["error"]
@@ -265,9 +273,11 @@ def test_analyze_ta_returns_unparseable_decision(monkeypatch, tmp_path: Path) ->
         raise AssertionError(url)
 
     monkeypatch.setattr(adapter_app.httpx, "post", fake_post)
-    job_id = TestClient(adapter_app.app).post(
-        "/analyze", json={"actor": "u", "symbol": "BTCUSDT"}
-    ).json()["job_id"]
+    job_id = (
+        TestClient(adapter_app.app)
+        .post("/analyze", json={"actor": "u", "symbol": "BTCUSDT"})
+        .json()["job_id"]
+    )
     _await_job(job_id, status="failed")
 
 
@@ -312,9 +322,7 @@ def test_get_jobs_filters_by_actor_and_status(monkeypatch, tmp_path: Path) -> No
 
 def test_get_job_unknown_returns_404(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
-    response = TestClient(adapter_app.app).get(
-        "/jobs/99999999-9999-4999-8999-999999999999"
-    )
+    response = TestClient(adapter_app.app).get("/jobs/99999999-9999-4999-8999-999999999999")
     assert response.status_code == 404
 
 
@@ -329,9 +337,11 @@ def test_analyze_orchestrator_failure_marks_job_failed(monkeypatch, tmp_path: Pa
         raise AssertionError(url)
 
     monkeypatch.setattr(adapter_app.httpx, "post", fake_post)
-    job_id = TestClient(adapter_app.app).post(
-        "/analyze", json={"actor": "u", "symbol": "BTCUSDT", "dry_run": True}
-    ).json()["job_id"]
+    job_id = (
+        TestClient(adapter_app.app)
+        .post("/analyze", json={"actor": "u", "symbol": "BTCUSDT", "dry_run": True})
+        .json()["job_id"]
+    )
     _await_job(job_id, status="failed")
 
 
@@ -347,23 +357,27 @@ def test_scorecard_metadata_includes_ta_date_and_exact_ticker_sent_to_bridge(
             payload = kwargs.get("json") or {}
             assert isinstance(payload, dict)
             seen_ticker.append(str(payload["ticker"]))
-            return FakeResponse({
-                "ok": True,
-                "ticker": payload["ticker"],
-                "date": payload["date"],
-                "decision": "BUY",
-                "provider": "deepseek",
-                "reports": {"market": "up", "news": "calm"},
-            })
+            return FakeResponse(
+                {
+                    "ok": True,
+                    "ticker": payload["ticker"],
+                    "date": payload["date"],
+                    "decision": "BUY",
+                    "provider": "deepseek",
+                    "reports": {"market": "up", "news": "calm"},
+                }
+            )
         if url.endswith("/scorecards"):
             posted.update(kwargs.get("json") or {})
             return FakeResponse({"scorecard_id": str(uuid4())})
         raise AssertionError(url)
 
     monkeypatch.setattr(adapter_app.httpx, "post", fake_post)
-    job_id = TestClient(adapter_app.app).post(
-        "/analyze", json={"actor": "u", "symbol": "BTCUSDT"}
-    ).json()["job_id"]
+    job_id = (
+        TestClient(adapter_app.app)
+        .post("/analyze", json={"actor": "u", "symbol": "BTCUSDT"})
+        .json()["job_id"]
+    )
     _await_job(job_id, status="succeeded")
 
     assert seen_ticker == ["BTC-USD"]
@@ -398,3 +412,52 @@ def test_reflect_outcome_endpoint_posts_to_bridge(monkeypatch) -> None:
     assert seen["ticker"] == "BTC-USD"
     assert seen["date"] == "2026-05-01"
     assert seen["raw_return"] == 0.12
+
+
+def test_scorecard_payload_records_crypto_benchmark_price(monkeypatch) -> None:
+    monkeypatch.setattr(adapter_app, "_fetch_benchmark_price", lambda symbol: "90000.00")
+    req = adapter_app.AnalyzeRequest(actor="u", symbol="ETHUSDT", asset_type="crypto")
+
+    payload = adapter_app._translate_to_scorecard_payload(
+        req,
+        {"ok": True, "decision": "BUY", "provider": "deepseek", "reports": {}},
+    )
+
+    metadata = payload["metadata"]
+    assert metadata["benchmark_symbol"] == "BTCUSDT"
+    assert metadata["benchmark_open_price"] == "90000.00"
+
+
+def test_scorecard_payload_self_benchmark_skips_price_fetch(monkeypatch) -> None:
+    called: list[str] = []
+
+    def fake_fetch(symbol: str) -> str | None:
+        called.append(symbol)
+        return "90000.00"
+
+    monkeypatch.setattr(adapter_app, "_fetch_benchmark_price", fake_fetch)
+    req = adapter_app.AnalyzeRequest(actor="u", symbol="BTCUSDT", asset_type="crypto")
+
+    payload = adapter_app._translate_to_scorecard_payload(
+        req,
+        {"ok": True, "decision": "HOLD", "provider": "deepseek", "reports": {}},
+    )
+
+    metadata = payload["metadata"]
+    assert metadata["benchmark_symbol"] == "self"
+    assert "benchmark_open_price" not in metadata
+    assert called == []
+
+
+def test_scorecard_payload_omits_benchmark_price_when_unavailable(monkeypatch) -> None:
+    monkeypatch.setattr(adapter_app, "_fetch_benchmark_price", lambda symbol: None)
+    req = adapter_app.AnalyzeRequest(actor="u", symbol="AAPL", asset_type="stock")
+
+    payload = adapter_app._translate_to_scorecard_payload(
+        req,
+        {"ok": True, "decision": "SELL", "provider": "deepseek", "reports": {}},
+    )
+
+    metadata = payload["metadata"]
+    assert metadata["benchmark_symbol"] == "SPY"
+    assert "benchmark_open_price" not in metadata

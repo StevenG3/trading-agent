@@ -238,4 +238,8 @@ curl 'http://localhost:8080/scorecard-outcomes/11111111-1111-4111-8111-111111111
 
 ### Outcome reflection
 
-Closed scorecard outcomes are pushed back through the analysis adapter to the TradingAgents bridge so future analyses can learn from paper-trading results. If the bridge is unavailable, `reflected_at` stays empty and operators can retry with `POST /reflect/pending?limit=50`. The outcomes summary includes `pending_reflection_count` per source.
+Closed scorecard outcomes are pushed back through the analysis adapter to the TradingAgents bridge so future analyses can learn from paper-trading results. The reflection payload includes raw return plus benchmark-adjusted alpha when the original scorecard captured a benchmark open price. If benchmark pricing is unavailable, alpha falls back to raw return and the payload carries an `alpha_note`. If the bridge is unavailable, `reflected_at` stays empty and operators can retry with `POST /reflect/pending?limit=50`. The outcomes summary includes `pending_reflection_count` per source.
+
+### Watchlists and scheduled analysis
+
+The orchestrator can keep an actor-scoped watchlist and periodically ask the analysis adapter to create fresh scorecards. Use `POST /watchlist` with `actor`, `symbol`, `asset_type`, and `cadence_minutes` (15-1440), `GET /watchlist?actor=...` to inspect active entries, and `DELETE /watchlist/{symbol}?actor=...` to disable one. Scheduler knobs live in `deploy/.env.example`: `SCHEDULER_ENABLED`, `SCHEDULER_TICK_SEC`, and `SCHEDULER_BATCH_LIMIT`.

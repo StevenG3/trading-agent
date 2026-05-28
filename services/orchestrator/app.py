@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import os
 import sqlite3
@@ -41,6 +43,7 @@ class _OutcomeSummaryBucket:
         self.open_count = 0
         self.total_pnl = Decimal("0")
 
+
 CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")
 HERMES_MODEL = os.getenv("HERMES_MODEL", "claude-haiku-4-5-20251001")
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
@@ -49,6 +52,10 @@ OPS_TOKEN = os.getenv("OPS_TOKEN", "")
 LIVE_UNLOCK_TTL_MIN = int(os.getenv("LIVE_UNLOCK_TTL_MIN", "15"))
 ANALYSIS_ADAPTER_URL = os.getenv("ANALYSIS_ADAPTER_URL", "http://analysis-adapter:8085")
 REFLECT_TIMEOUT_SEC = float(os.getenv("REFLECT_TIMEOUT_SEC", "60"))
+SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "true").lower() == "true"
+SCHEDULER_TICK_SEC = float(os.getenv("SCHEDULER_TICK_SEC", "60"))
+SCHEDULER_BATCH_LIMIT = int(os.getenv("SCHEDULER_BATCH_LIMIT", "5"))
+_scheduler_task: asyncio.Task[None] | None = None
 
 _HERMES_SYSTEM_PROMPT = """\
 You are an order intent parser for a cryptocurrency spot trading platform (Binance Spot only).
@@ -120,6 +127,15 @@ class ScorecardIntentRequest(BaseModel):
     request_id: UUID | None = None
 
 
+class WatchlistAddRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    actor: str = PydanticField(min_length=1)
+    symbol: str = PydanticField(min_length=1)
+    asset_type: Literal["stock", "crypto"] = "crypto"
+    cadence_minutes: int = PydanticField(ge=15, le=1440)
+
+
 class LiveUnlockRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -128,6 +144,7 @@ class LiveUnlockRequest(BaseModel):
 
 ScorecardCreateRequest.model_rebuild(_types_namespace={"Literal": Literal})
 ScorecardIntentRequest.model_rebuild(_types_namespace={"Literal": Literal, "UUID": UUID})
+WatchlistAddRequest.model_rebuild(_types_namespace={"Literal": Literal})
 LiveUnlockRequest.model_rebuild()
 
 
@@ -141,6 +158,85 @@ async def validation_exception_handler(
 ) -> JSONResponse:
     _ = request
     return JSONResponse(status_code=400, content=jsonable_encoder({"detail": exc.errors()}))
+
+
+def _watchlist_row_to_dict(row: sqlite3.Row) -> dict[str, object]:
+    return {
+        "actor": row["actor"],
+        "symbol": row["symbol"],
+        "asset_type": row["asset_type"],
+        "cadence_minutes": row["cadence_minutes"],
+        "last_run_at": row["last_run_at"],
+        "next_run_at": row["next_run_at"],
+        "enabled": bool(row["enabled"]),
+        "created_at": row["created_at"],
+    }
+
+
+def _fire_scheduled_analysis(actor: str, symbol: str, asset_type: str) -> bool:
+    try:
+        response = httpx.post(
+            f"{ANALYSIS_ADAPTER_URL}/analyze",
+            json={"actor": actor, "symbol": symbol, "asset_type": asset_type},
+            timeout=10.0,
+        )
+        response.raise_for_status()
+        return True
+    except httpx.HTTPError:
+        return False
+
+
+def scheduler_tick(now: datetime | None = None) -> dict[str, int]:
+    now = now or _now()
+    now_iso = now.isoformat()
+    with connect() as conn:
+        rows = conn.execute(
+            "select actor, symbol, asset_type, cadence_minutes from watchlist_entries "
+            "where enabled = 1 and next_run_at <= ? order by next_run_at asc limit ?",
+            (now_iso, SCHEDULER_BATCH_LIMIT),
+        ).fetchall()
+    fired = 0
+    failed = 0
+    for row in rows:
+        cadence = int(row["cadence_minutes"])
+        ok = _fire_scheduled_analysis(str(row["actor"]), str(row["symbol"]), str(row["asset_type"]))
+        next_run = now + timedelta(minutes=cadence if ok else max(cadence, 60))
+        with connect() as conn:
+            conn.execute(
+                "update watchlist_entries set last_run_at = ?, next_run_at = ? "
+                "where actor = ? and symbol = ?",
+                (now_iso, next_run.isoformat(), row["actor"], row["symbol"]),
+            )
+            conn.commit()
+        if ok:
+            fired += 1
+        else:
+            failed += 1
+    return {"due": len(rows), "fired": fired, "failed": failed}
+
+
+async def _scheduler_loop() -> None:
+    while True:
+        scheduler_tick()
+        await asyncio.sleep(SCHEDULER_TICK_SEC)
+
+
+@app.on_event("startup")
+async def _start_scheduler() -> None:
+    global _scheduler_task
+    if SCHEDULER_ENABLED and _scheduler_task is None:
+        _scheduler_task = asyncio.create_task(_scheduler_loop())
+
+
+@app.on_event("shutdown")
+async def _stop_scheduler() -> None:
+    global _scheduler_task
+    if _scheduler_task is None:
+        return
+    _scheduler_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await _scheduler_task
+    _scheduler_task = None
 
 
 def _now() -> datetime:
@@ -322,8 +418,6 @@ def _q8s(value: Decimal) -> str:
     return f"{_q8(value):.8f}"
 
 
-
-
 def _maybe_open_scorecard_outcome(
     execution: ExecutionResult,
     intent: OrderIntent,
@@ -443,6 +537,26 @@ def _scorecard_metadata(scorecard_id: str) -> dict[str, str]:
     return metadata if isinstance(metadata, dict) else {}
 
 
+def _compute_alpha_return(
+    raw_return: Decimal, benchmark_symbol: str | None, benchmark_open: str | None
+) -> tuple[Decimal, str | None]:
+    if not benchmark_symbol or benchmark_symbol == "self":
+        return _q8(raw_return), "benchmark unavailable; using raw return as alpha"
+    if not benchmark_open:
+        return _q8(raw_return), "benchmark open price unavailable; using raw return as alpha"
+    try:
+        open_price = Decimal(str(benchmark_open))
+        if open_price <= 0:
+            raise InvalidOperation
+    except (InvalidOperation, ValueError):
+        return _q8(raw_return), "benchmark open price invalid; using raw return as alpha"
+    close_price, _source = _mark_for_symbol_str(benchmark_symbol)
+    if close_price is None:
+        return _q8(raw_return), "benchmark close price unavailable; using raw return as alpha"
+    benchmark_return = (close_price - open_price) / open_price
+    return _q8(raw_return - benchmark_return), None
+
+
 def _holding_days(opened_at: str | None, closed_at: str | None) -> int:
     try:
         opened = datetime.fromisoformat(str(opened_at).replace("Z", "+00:00"))
@@ -455,17 +569,27 @@ def _holding_days(opened_at: str | None, closed_at: str | None) -> int:
 def _push_outcome_reflection(outcome: dict[str, object]) -> bool:
     metadata = _scorecard_metadata(str(outcome.get("scorecard_id", "")))
     closed_return = str(outcome.get("closed_return_pct") or "0")
+    try:
+        raw_return = _q8(Decimal(closed_return))
+    except (InvalidOperation, ValueError):
+        raw_return = Decimal("0")
+    benchmark_symbol = metadata.get("benchmark_symbol")
+    alpha_return, alpha_note = _compute_alpha_return(
+        raw_return, benchmark_symbol, metadata.get("benchmark_open_price")
+    )
     payload = {
         "ticker": metadata.get("ta_ticker") or outcome.get("symbol"),
         "trade_date": metadata.get("ta_date") or str(outcome.get("opened_at", ""))[:10],
-        "raw_return": closed_return,
-        "alpha_return": closed_return,
+        "raw_return": _q8s(raw_return),
+        "alpha_return": _q8s(alpha_return),
         "holding_days": _holding_days(
             str(outcome.get("opened_at") or ""), str(outcome.get("closed_at") or "")
         ),
         "provider": metadata.get("provider"),
-        "benchmark_name": "paper-position-baseline",
+        "benchmark_name": benchmark_symbol or "paper-position-baseline",
     }
+    if alpha_note:
+        payload["alpha_note"] = alpha_note
     try:
         response = httpx.post(
             f"{ANALYSIS_ADAPTER_URL}/reflect/outcome",
@@ -486,6 +610,7 @@ def _mark_outcome_reflected(outcome_id: str) -> None:
             (_now().isoformat(), outcome_id),
         )
         conn.commit()
+
 
 def _update_position(execution: ExecutionResult, intent: OrderIntent) -> None:
     if execution.avg_price is None or execution.filled_qty == Decimal("0"):
@@ -560,6 +685,10 @@ def _update_position(execution: ExecutionResult, intent: OrderIntent) -> None:
                 )
         except Exception:
             pass
+
+
+def _mark_for_symbol_str(symbol: str) -> tuple[Decimal | None, str | None]:
+    return _mark_for_symbol(symbol)
 
 
 def _mark_for_symbol(symbol: str) -> tuple[Decimal | None, str | None]:
@@ -676,9 +805,7 @@ def _consume_live_unlock_or_error(token: str, actor: str, dry: bool) -> JSONResp
             )
             conn.commit()
         if cursor.rowcount == 0:
-            return JSONResponse(
-                status_code=403, content={"code": "LIVE_UNLOCK_ALREADY_USED"}
-            )
+            return JSONResponse(status_code=403, content={"code": "LIVE_UNLOCK_ALREADY_USED"})
     return None
 
 
@@ -753,6 +880,63 @@ def healthz() -> dict[str, str]:
 @app.get("/readyz")
 def readyz() -> dict[str, str]:
     return {"status": "ready"}
+
+
+@app.post("/watchlist", response_model=None)
+def add_watchlist(req: WatchlistAddRequest) -> dict[str, object]:
+    now = _now()
+    next_run = now + timedelta(minutes=req.cadence_minutes)
+    symbol = req.symbol.upper()
+    with connect() as conn:
+        conn.execute(
+            "insert into watchlist_entries "
+            "(actor, symbol, asset_type, cadence_minutes, last_run_at, "
+            "next_run_at, enabled, created_at) "
+            "values (?,?,?,?,NULL,?,?,?) "
+            "on conflict(actor, symbol) do update set "
+            "asset_type = excluded.asset_type, cadence_minutes = excluded.cadence_minutes, "
+            "next_run_at = excluded.next_run_at, enabled = 1",
+            (
+                req.actor,
+                symbol,
+                req.asset_type,
+                req.cadence_minutes,
+                next_run.isoformat(),
+                1,
+                now.isoformat(),
+            ),
+        )
+        row = conn.execute(
+            "select actor, symbol, asset_type, cadence_minutes, last_run_at, "
+            "next_run_at, enabled, created_at "
+            "from watchlist_entries where actor = ? and symbol = ?",
+            (req.actor, symbol),
+        ).fetchone()
+        conn.commit()
+    return {"item": _watchlist_row_to_dict(row)}
+
+
+@app.get("/watchlist", response_model=None)
+def list_watchlist(actor: str = Query(..., min_length=1)) -> dict[str, object]:
+    with connect() as conn:
+        rows = conn.execute(
+            "select actor, symbol, asset_type, cadence_minutes, last_run_at, "
+            "next_run_at, enabled, created_at "
+            "from watchlist_entries where actor = ? and enabled = 1 order by symbol",
+            (actor,),
+        ).fetchall()
+    return {"items": [_watchlist_row_to_dict(row) for row in rows]}
+
+
+@app.delete("/watchlist/{symbol}", response_model=None)
+def delete_watchlist(symbol: str, actor: str = Query(..., min_length=1)) -> dict[str, bool]:
+    with connect() as conn:
+        cursor = conn.execute(
+            "update watchlist_entries set enabled = 0 where actor = ? and symbol = ?",
+            (actor, symbol.upper()),
+        )
+        conn.commit()
+    return {"deleted": cursor.rowcount > 0}
 
 
 @app.post("/admin/live-unlock", response_model=None)
@@ -995,9 +1179,7 @@ def outcomes_summary(actor: str | None = None, since: str | None = None) -> dict
             "hits": bucket.hits,
             "losses": bucket.losses,
             "hit_rate": (
-                f"{bucket.hits / bucket.closed_count:.4f}"
-                if bucket.closed_count
-                else "0.0000"
+                f"{bucket.hits / bucket.closed_count:.4f}" if bucket.closed_count else "0.0000"
             ),
             "realized_pnl": _q8s(bucket.total_pnl),
             "total_pnl": _q8s(bucket.total_pnl),
