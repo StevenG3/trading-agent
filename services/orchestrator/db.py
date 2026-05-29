@@ -139,10 +139,18 @@ def init_db(conn: sqlite3.Connection) -> None:
             date text not null,
             realized_delta text not null,
             symbol text not null,
+            venue text not null default 'binance_spot',
             created_at text not null
         )
         """
     )
+    try:
+        conn.execute(
+            "alter table daily_pnl add column venue text not null default 'binance_spot'"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
     conn.execute("create index if not exists idx_daily_pnl_actor_date on daily_pnl(actor, date)")
     conn.execute(
         """
@@ -232,6 +240,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             daily_live_budget_usdt text not null default '0',
             per_live_trade_max_usdt text not null default '50',
             max_live_exposure_usdt text not null default '0',
+            max_us_equity_exposure_usd text not null default '0',
             daily_live_trade_count_max integer not null default 3,
             min_calibrated_conviction text not null default '0.70',
             min_closed_outcomes integer not null default 20,
@@ -245,6 +254,14 @@ def init_db(conn: sqlite3.Connection) -> None:
         conn.execute(
             "alter table live_autonomy_settings "
             "add column max_live_exposure_usdt text not null default '0'"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            "alter table live_autonomy_settings "
+            "add column max_us_equity_exposure_usd text not null default '0'"
         )
         conn.commit()
     except sqlite3.OperationalError:

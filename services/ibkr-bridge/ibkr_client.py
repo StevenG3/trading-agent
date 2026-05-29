@@ -20,6 +20,7 @@ MarketOrder: Any = getattr(_ib_async, "MarketOrder", None)
 Stock: Any = getattr(_ib_async, "Stock", None)
 
 logger = logging.getLogger(__name__)
+LIVE_GATEWAY_PORTS = {7496, 4001}
 
 OrderStatus = Literal["pending", "submitted", "filled", "partial", "canceled", "rejected", "error"]
 
@@ -52,10 +53,11 @@ class IBKRConfig:
     port: int = 4002
     client_id: int = 1
     timeout_sec: float = 10.0
+    allow_live_port: bool = False
 
 
 def _is_live_gateway_port(port: int) -> bool:
-    if port in {7496, 4001}:
+    if port in LIVE_GATEWAY_PORTS:
         logger.warning("IBKR bridge configured for a live gateway port: %s", port)
         return True
     return False
@@ -97,7 +99,15 @@ class IBKRClient:
     def connect(self) -> None:
         if IB is None:
             raise RuntimeError("ib_async is not installed")
-        _is_live_gateway_port(self._config.port)
+        if _is_live_gateway_port(self._config.port):
+            if not self._config.allow_live_port:
+                raise RuntimeError(
+                    "LIVE_PORT_NOT_AUTHORIZED: set IBKR_ALLOW_LIVE_PORT=true to use "
+                    f"IBKR live gateway port {self._config.port}"
+                )
+            logger.warning("IBKR_AUDIT live_port_authorized port=%s", self._config.port)
+        else:
+            logger.info("IBKR_AUDIT paper_port port=%s", self._config.port)
         self._ib = IB()
         self._ib.connect(
             self._config.host,

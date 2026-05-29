@@ -137,3 +137,11 @@ def test_ticker(monkeypatch) -> None:
     response = TestClient(bridge_app.app).get("/tickers/NVDA")
     assert response.status_code == 200
     assert response.json() == {"symbol": "NVDA", "price": "452.50", "source": "ibkr"}
+
+
+def test_config_reads_live_port_authorization(monkeypatch) -> None:
+    monkeypatch.setenv("IBKR_GATEWAY_PORT", "7496")
+    monkeypatch.setenv("IBKR_ALLOW_LIVE_PORT", "true")
+    cfg = bridge_app._config_from_env()
+    assert cfg.port == 7496
+    assert cfg.allow_live_port is True

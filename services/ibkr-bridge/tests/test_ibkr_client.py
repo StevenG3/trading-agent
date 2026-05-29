@@ -5,6 +5,7 @@ import sys
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from typing import NoReturn
 
 import pytest
 
@@ -156,3 +157,45 @@ def test_live_gateway_port_warns(caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.WARNING)
     assert _is_live_gateway_port(7496) is True
     assert "live" in caplog.text.lower()
+
+
+def test_live_port_refused_without_authorization(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_if_instantiated() -> NoReturn:
+        raise AssertionError("IBKR network client should not be created")
+
+    monkeypatch.setattr("ibkr_client.IB", fail_if_instantiated)
+    client = IBKRClient(IBKRConfig(port=7496, allow_live_port=False))
+    with pytest.raises(RuntimeError, match="LIVE_PORT_NOT_AUTHORIZED"):
+        client.connect()
+
+
+def test_live_port_4001_refused_without_authorization(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_if_instantiated() -> NoReturn:
+        raise AssertionError("IBKR network client should not be created")
+
+    monkeypatch.setattr("ibkr_client.IB", fail_if_instantiated)
+    client = IBKRClient(IBKRConfig(port=4001, allow_live_port=False))
+    with pytest.raises(RuntimeError, match="LIVE_PORT_NOT_AUTHORIZED"):
+        client.connect()
+
+
+def test_live_port_connects_when_authorized(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr("ibkr_client.IB", FakeIB)
+    caplog.set_level(logging.WARNING)
+    client = IBKRClient(IBKRConfig(port=7496, allow_live_port=True))
+    client.connect()
+    assert client.is_ready() is True
+    assert "IBKR_AUDIT live_port_authorized" in caplog.text
+
+
+def test_paper_port_logs_audit_info(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr("ibkr_client.IB", FakeIB)
+    caplog.set_level(logging.INFO)
+    client = IBKRClient(IBKRConfig(port=4002, allow_live_port=False))
+    client.connect()
+    assert client.is_ready() is True
+    assert "IBKR_AUDIT paper_port" in caplog.text

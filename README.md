@@ -97,6 +97,8 @@ paper Gateway/TWS. The default remains safe:
 IBKR_MODE=stub
 IBKR_GATEWAY_HOST=host.docker.internal
 IBKR_GATEWAY_PORT=4002
+IBKR_ALLOW_LIVE_PORT=false
+IBKR_LIVE_TRADING_ENABLED=false
 IBKR_CLIENT_ID=1
 ```
 
@@ -112,8 +114,11 @@ curl -s http://127.0.0.1:18086/readyz
 ```
 
 `/healthz` only proves the bridge process is running. `/readyz` returns ready
-only when it can connect to Gateway/TWS. Live IBKR stock trading is still blocked
-with `LIVE_NOT_AVAILABLE_PHASE_21`; Phase 21 is paper-only.
+only when it can connect to Gateway/TWS. Phase 22 unlocks live US equities only
+behind separate gates: global `LIVE_TRADING_ENABLED=true`,
+`IBKR_LIVE_TRADING_ENABLED=true` in risk and execution services, and
+`IBKR_ALLOW_LIVE_PORT=true` before the bridge may connect to live Gateway ports
+`7496` or `4001`. Leave all three false for paper mode.
 
 
 ## Phase 2

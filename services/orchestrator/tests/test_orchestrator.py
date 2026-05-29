@@ -2085,6 +2085,38 @@ def test_get_pnl_today_includes_unrealized_marks(monkeypatch, tmp_path: Path) ->
     assert body["total_pnl"] == "50.00000000"
 
 
+def test_get_pnl_today_filters_by_venue(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    today = orchestrator_app._today()
+    with orchestrator_app.connect() as conn:
+        conn.execute(
+            "insert into daily_pnl "
+            "(actor, date, realized_delta, symbol, venue, created_at) values (?,?,?,?,?,?)",
+            ("tg_1", today, "12.50", "BTCUSDT", "binance_spot", "now"),
+        )
+        conn.execute(
+            "insert into daily_pnl "
+            "(actor, date, realized_delta, symbol, venue, created_at) values (?,?,?,?,?,?)",
+            ("tg_1", today, "7.25", "NVDA", "ibkr_us_equity", "now"),
+        )
+        conn.commit()
+
+    client = TestClient(orchestrator_app.app)
+    assert client.get("/pnl/today?actor=tg_1&venue=binance_spot").json()["realized_pnl"] == (
+        "12.50000000"
+    )
+    stock = client.get("/pnl/today?actor=tg_1&venue=ibkr_us_equity").json()
+    assert stock["realized_pnl"] == "7.25000000"
+    assert stock["by_symbol"]["realized"] == {"NVDA": "7.25000000"}
+
+
+def test_get_pnl_today_rejects_invalid_venue(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    response = TestClient(orchestrator_app.app).get("/pnl/today?actor=tg_1&venue=forex")
+    assert response.status_code == 400
+    assert response.json()["code"] == "INVALID_VENUE"
+
+
 # -- Phase 10 debt fixes -----------------------------------------------------
 
 
@@ -3374,6 +3406,171 @@ def test_live_autonomy_settings_include_exposure_cap(monkeypatch, tmp_path: Path
     assert loaded["current_live_exposure_usdt"] == "0"
 
 
+def test_live_autonomy_settings_include_us_equity_exposure_cap(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    client = TestClient(orchestrator_app.app)
+    assert (
+        client.post(
+            "/live-autonomy/settings",
+            json={"actor": "tg_1", "max_us_equity_exposure_usd": "-1"},
+        ).json()["code"]
+        == "INVALID_MAX_US_EQUITY_EXPOSURE"
+    )
+    assert (
+        client.post(
+            "/live-autonomy/settings",
+            json={"actor": "tg_1", "max_us_equity_exposure_usd": "100000.01"},
+        ).json()["code"]
+        == "MAX_US_EQUITY_EXPOSURE_TOO_HIGH"
+    )
+    saved = client.post(
+        "/live-autonomy/settings",
+        json={"actor": "tg_1", "max_us_equity_exposure_usd": "5000"},
+    ).json()
+    assert saved["max_us_equity_exposure_usd"] == "5000"
+    loaded = client.get("/live-autonomy/settings", params={"actor": "tg_1"}).json()
+    assert loaded["max_us_equity_exposure_usd"] == "5000"
+    assert loaded["current_us_equity_exposure_usd"] == "0"
+
+
+def test_live_auto_stock_requires_us_equity_exposure_cap(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(orchestrator_app, "LIVE_AUTONOMY_GLOBAL_ENABLED", True)
+    settings = {
+        "enabled": True,
+        "allowed_sources": "tradingagents",
+        "min_calibrated_conviction": "0.70",
+        "min_closed_outcomes": 5,
+        "daily_live_budget_usdt": "1000",
+        "per_live_trade_max_usdt": "25",
+        "max_live_exposure_usdt": "1000",
+        "daily_live_trade_count_max": 3,
+    }
+    scorecard = {
+        "source": "tradingagents",
+        "conviction": "0.9",
+        "metadata": {"asset_type": "stock", "heuristic_conviction": "0.9"},
+    }
+    with orchestrator_app.connect() as conn:
+        conn.execute(
+            "insert into conviction_calibration values (?,?,?,?,?,?,?,?,?)",
+            ("tradingagents", "stock", "0.90-1.01", 5, 5, "0", "1", "0.9", "now"),
+        )
+        conn.commit()
+
+    allowed, reason = orchestrator_app._eligible_for_live_auto("tg_1", scorecard, settings)
+    assert allowed is False
+    assert reason == "MAX_US_EQUITY_EXPOSURE_NOT_SET"
+
+
+def test_live_auto_stock_exposure_cap_breach_uses_stock_positions(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(orchestrator_app, "LIVE_AUTONOMY_GLOBAL_ENABLED", True)
+    settings = {
+        "enabled": True,
+        "allowed_sources": "tradingagents",
+        "min_calibrated_conviction": "0.70",
+        "min_closed_outcomes": 5,
+        "daily_live_budget_usdt": "1000",
+        "per_live_trade_max_usdt": "50",
+        "max_live_exposure_usdt": "1000",
+        "max_us_equity_exposure_usd": "100",
+        "daily_live_trade_count_max": 3,
+    }
+    scorecard = {
+        "source": "tradingagents",
+        "conviction": "0.9",
+        "metadata": {"asset_type": "stock", "heuristic_conviction": "0.9"},
+    }
+    with orchestrator_app.connect() as conn:
+        conn.execute(
+            "insert into conviction_calibration values (?,?,?,?,?,?,?,?,?)",
+            ("tradingagents", "stock", "0.90-1.01", 5, 5, "0", "1", "0.9", "now"),
+        )
+        conn.execute(
+            """
+            insert into paper_positions
+              (actor, symbol, qty, avg_cost, total_cost, realized_pnl,
+               paper_qty, paper_avg_cost, live_qty, live_avg_cost, venue, last_updated)
+            values (?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "tg_1",
+                "NVDA",
+                "1",
+                "80",
+                "80",
+                "0",
+                "0",
+                "0",
+                "1",
+                "80",
+                "ibkr_us_equity",
+                "now",
+            ),
+        )
+        conn.commit()
+
+    allowed, reason = orchestrator_app._eligible_for_live_auto("tg_1", scorecard, settings)
+    assert allowed is False
+    assert reason == "US_EQUITY_EXPOSURE_CAP_BREACHED:80.00000000/100"
+
+
+def test_live_auto_daily_budget_is_shared_across_venues(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(orchestrator_app, "LIVE_AUTONOMY_GLOBAL_ENABLED", True)
+    settings = {
+        "enabled": True,
+        "allowed_sources": "tradingagents",
+        "min_calibrated_conviction": "0.70",
+        "min_closed_outcomes": 5,
+        "daily_live_budget_usdt": "100",
+        "per_live_trade_max_usdt": "60",
+        "max_live_exposure_usdt": "1000",
+        "max_us_equity_exposure_usd": "1000",
+        "daily_live_trade_count_max": 3,
+    }
+    scorecard = {
+        "source": "tradingagents",
+        "conviction": "0.9",
+        "metadata": {"asset_type": "stock", "heuristic_conviction": "0.9"},
+    }
+    with orchestrator_app.connect() as conn:
+        conn.execute(
+            "insert into conviction_calibration values (?,?,?,?,?,?,?,?,?)",
+            ("tradingagents", "stock", "0.90-1.01", 5, 5, "0", "1", "0.9", "now"),
+        )
+        conn.execute(
+            "insert into live_autonomy_spend "
+            "(actor, date, spent_usdt, trade_count, last_updated) values (?,?,?,?,?)",
+            ("tg_1", orchestrator_app._today(), "50", 1, "now"),
+        )
+        conn.commit()
+
+    allowed, reason = orchestrator_app._eligible_for_live_auto("tg_1", scorecard, settings)
+    assert allowed is False
+    assert reason == "DAILY_BUDGET_EXHAUSTED"
+
+
+def test_live_auto_drawdown_check_remains_actor_wide(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    calls: list[dict[str, object]] = []
+
+    def fake_pnl_today(**kwargs: object) -> dict[str, str]:
+        calls.append(kwargs)
+        return {"total_pnl": "0"}
+
+    monkeypatch.setattr(orchestrator_app, "get_pnl_today", fake_pnl_today)
+    assert orchestrator_app._check_drawdown_for_live_auto("tg_1") is None
+    assert calls == [{"actor": "tg_1"}]
+
+
 def test_notification_subscribe_sends_hmac_fill_and_records_delivery(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -3610,7 +3807,7 @@ def test_live_exposure_cap_uses_live_bucket_only(monkeypatch, tmp_path: Path) ->
         conn.commit()
 
     allowed, current = orchestrator_app._check_live_exposure_cap(
-        "tg_1", Decimal("5"), Decimal("100")
+        "tg_1", Decimal("5"), Decimal("100"), "binance_spot"
     )
 
     assert allowed is True
@@ -3667,7 +3864,7 @@ def test_live_exposure_cap_ignores_stock_positions(monkeypatch, tmp_path: Path) 
         conn.commit()
 
     allowed, current = orchestrator_app._check_live_exposure_cap(
-        "tg_1", Decimal("5"), Decimal("100")
+        "tg_1", Decimal("5"), Decimal("100"), "binance_spot"
     )
     assert allowed is True
     assert current == Decimal("90.00000000")

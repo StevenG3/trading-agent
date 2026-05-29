@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -10,6 +11,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from ibkr_client import IBKRClient, IBKRConfig, PlaceOrderRequest
+
+logger = logging.getLogger(__name__)
 
 
 class BridgeOrderResponse(BaseModel):
@@ -35,6 +38,7 @@ def _config_from_env() -> IBKRConfig:
         port=int(os.getenv("IBKR_GATEWAY_PORT", "4002")),
         client_id=int(os.getenv("IBKR_CLIENT_ID", "1")),
         timeout_sec=float(os.getenv("IBKR_CONNECT_TIMEOUT_SEC", "10")),
+        allow_live_port=os.getenv("IBKR_ALLOW_LIVE_PORT", "false").lower() == "true",
     )
 
 
@@ -45,6 +49,9 @@ client = IBKRClient(_config_from_env())
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     try:
         client.connect()
+    except RuntimeError as exc:
+        logger.error("IBKR bridge startup failed: %s", exc)
+        raise
     except Exception:
         # healthz stays up; readyz exposes disconnected state until Gateway/TWS appears.
         pass

@@ -60,6 +60,7 @@ services:
       CONFIRMATION_THRESHOLD_USDT: "500"
       PER_SYMBOL_DAILY_LIMIT_USDT: "50000"
       LIVE_TRADING_ENABLED: "false"
+      IBKR_LIVE_TRADING_ENABLED: "false"
       ORCHESTRATOR_URL: http://orchestrator:8080
       DAILY_DRAWDOWN_HARD_STOP_USDT: "1000"
     depends_on:
@@ -82,6 +83,7 @@ services:
       DATA_DIR: /data
       MARKET_DATA_URL: http://market-data:8083
       LIVE_TRADING_ENABLED: "false"
+      IBKR_LIVE_TRADING_ENABLED: "false"
       EXCHANGE_API_KEY: ""
       EXCHANGE_API_SECRET: ""
       IBKR_MODE: ${IBKR_MODE:-stub}
@@ -153,6 +155,7 @@ services:
       IBKR_GATEWAY_PORT: ${IBKR_GATEWAY_PORT:-4002}
       IBKR_CLIENT_ID: ${IBKR_CLIENT_ID:-1}
       IBKR_CONNECT_TIMEOUT_SEC: ${IBKR_CONNECT_TIMEOUT_SEC:-10}
+      IBKR_ALLOW_LIVE_PORT: ${IBKR_ALLOW_LIVE_PORT:-false}
     extra_hosts:
       - "ibkr-host:host-gateway"
     ports:

@@ -169,6 +169,7 @@ class LiveAutonomyUpdateRequest(BaseModel):
     daily_live_budget_usdt: str | None = None
     per_live_trade_max_usdt: str | None = None
     max_live_exposure_usdt: str | None = None
+    max_us_equity_exposure_usd: str | None = None
     daily_live_trade_count_max: int | None = None
     min_calibrated_conviction: str | None = None
     min_closed_outcomes: int | None = None
@@ -948,13 +949,14 @@ def _update_position(execution: ExecutionResult, intent: OrderIntent) -> None:
         )
         if realized_delta != Decimal("0"):
             conn.execute(
-                "insert into daily_pnl (actor, date, realized_delta, symbol, created_at) "
-                "values (?,?,?,?,?)",
+                "insert into daily_pnl "
+                "(actor, date, realized_delta, symbol, venue, created_at) values (?,?,?,?,?,?)",
                 (
                     intent.actor,
                     _today(),
                     _q8s(realized_delta),
                     intent.symbol,
+                    intent.venue,
                     _now().isoformat(),
                 ),
             )
@@ -1267,7 +1269,9 @@ def _default_live_autonomy(actor: str) -> dict[str, object]:
         "daily_live_budget_usdt": "0",
         "per_live_trade_max_usdt": "50",
         "max_live_exposure_usdt": "0",
+        "max_us_equity_exposure_usd": "0",
         "current_live_exposure_usdt": "0",
+        "current_us_equity_exposure_usd": "0",
         "daily_live_trade_count_max": 3,
         "min_calibrated_conviction": "0.70",
         "min_closed_outcomes": 20,
@@ -1281,8 +1285,12 @@ def _live_autonomy_row_to_dict(actor: str, row: sqlite3.Row | None) -> dict[str,
     if row is None:
         return _default_live_autonomy(actor)
     max_exposure = str(row["max_live_exposure_usdt"])
+    max_stock_exposure = str(row["max_us_equity_exposure_usd"])
     current_exposure = _check_live_exposure_cap(
-        actor, Decimal("0"), Decimal(max_exposure)
+        actor, Decimal("0"), Decimal(max_exposure), "binance_spot"
+    )[1]
+    current_stock_exposure = _check_live_exposure_cap(
+        actor, Decimal("0"), Decimal(max_stock_exposure), "ibkr_us_equity"
     )[1]
     return {
         "actor": actor,
@@ -1290,7 +1298,11 @@ def _live_autonomy_row_to_dict(actor: str, row: sqlite3.Row | None) -> dict[str,
         "daily_live_budget_usdt": str(row["daily_live_budget_usdt"]),
         "per_live_trade_max_usdt": str(row["per_live_trade_max_usdt"]),
         "max_live_exposure_usdt": max_exposure,
+        "max_us_equity_exposure_usd": max_stock_exposure,
         "current_live_exposure_usdt": _q8s(current_exposure) if current_exposure else "0",
+        "current_us_equity_exposure_usd": (
+            _q8s(current_stock_exposure) if current_stock_exposure else "0"
+        ),
         "daily_live_trade_count_max": int(row["daily_live_trade_count_max"]),
         "min_calibrated_conviction": str(row["min_calibrated_conviction"]),
         "min_closed_outcomes": int(row["min_closed_outcomes"]),
@@ -1318,7 +1330,7 @@ def _check_drawdown_for_live_auto(actor: str) -> str | None:
 
 
 def _check_live_exposure_cap(
-    actor: str, proposed_notional: Decimal, max_cap: Decimal
+    actor: str, proposed_notional: Decimal, max_cap: Decimal, venue: str
 ) -> tuple[bool, Decimal]:
     with connect() as conn:
         rows = conn.execute(
@@ -1326,16 +1338,23 @@ def _check_live_exposure_cap(
             select p.live_qty, p.live_avg_cost
             from paper_positions p
             where p.actor = ?
-              and p.venue = 'binance_spot'
+              and p.venue = ?
               and cast(p.live_qty as real) > 0
             """,
-            (actor,),
+            (actor, venue),
         ).fetchall()
     current = Decimal("0")
     for row in rows:
         current += Decimal(str(row["live_qty"])) * Decimal(str(row["live_avg_cost"]))
     current = _q8(current)
     return current + proposed_notional <= max_cap, current
+
+
+def _venue_for_scorecard(scorecard: dict[str, object]) -> str:
+    metadata = scorecard.get("metadata") or {}
+    if isinstance(metadata, dict) and str(metadata.get("asset_type") or "crypto") == "stock":
+        return "ibkr_us_equity"
+    return "binance_spot"
 
 
 def stop_loss_watchdog_tick(now: datetime | None = None) -> dict[str, int]:
@@ -1584,18 +1603,26 @@ def _eligible_for_live_auto(
         ).fetchone()
     spent = Decimal(str(spend["spent_usdt"])) if spend else Decimal("0")
     count = int(spend["trade_count"]) if spend else 0
+    venue = _venue_for_scorecard(scorecard)
     try:
-        max_cap = Decimal(str(settings.get("max_live_exposure_usdt", "0")))
+        if venue == "ibkr_us_equity":
+            max_cap = Decimal(str(settings.get("max_us_equity_exposure_usd", "0")))
+            cap_not_set_reason = "MAX_US_EQUITY_EXPOSURE_NOT_SET"
+            cap_breached_reason = "US_EQUITY_EXPOSURE_CAP_BREACHED"
+        else:
+            max_cap = Decimal(str(settings.get("max_live_exposure_usdt", "0")))
+            cap_not_set_reason = "MAX_LIVE_EXPOSURE_NOT_SET"
+            cap_breached_reason = "LIVE_EXPOSURE_CAP_BREACHED"
         proposed = Decimal(str(settings.get("per_live_trade_max_usdt", "0")))
     except (InvalidOperation, ValueError):
         return False, "INVALID_LIVE_EXPOSURE_CAP"
     if max_cap <= 0:
-        return False, "MAX_LIVE_EXPOSURE_NOT_SET"
-    allowed_by_cap, current_exposure = _check_live_exposure_cap(actor, proposed, max_cap)
+        return False, cap_not_set_reason
+    allowed_by_cap, current_exposure = _check_live_exposure_cap(actor, proposed, max_cap, venue)
     if not allowed_by_cap:
-        return False, f"LIVE_EXPOSURE_CAP_BREACHED:{_q8s(current_exposure)}/{max_cap}"
+        return False, f"{cap_breached_reason}:{_q8s(current_exposure)}/{max_cap}"
     budget = Decimal(str(settings.get("daily_live_budget_usdt", "0")))
-    if spent >= budget:
+    if spent + proposed > budget:
         return False, "DAILY_BUDGET_EXHAUSTED"
     if count >= int(str(settings.get("daily_live_trade_count_max", 3))):
         return False, "DAILY_TRADE_COUNT_EXHAUSTED"
@@ -1691,7 +1718,8 @@ def live_auto_trade_tick(now: datetime | None = None) -> dict[str, object]:
     with connect() as conn:
         actors = conn.execute(
             "select actor, enabled, daily_live_budget_usdt, per_live_trade_max_usdt, "
-            "max_live_exposure_usdt, daily_live_trade_count_max, min_calibrated_conviction, "
+            "max_live_exposure_usdt, max_us_equity_exposure_usd, "
+            "daily_live_trade_count_max, min_calibrated_conviction, "
             "min_closed_outcomes, allowed_sources, created_at, updated_at "
             "from live_autonomy_settings where enabled = 1"
         ).fetchall()
@@ -2094,7 +2122,8 @@ def update_live_autonomy(req: LiveAutonomyUpdateRequest) -> JSONResponse | dict[
     with connect() as conn:
         row = conn.execute(
             "select enabled, daily_live_budget_usdt, per_live_trade_max_usdt, "
-            "max_live_exposure_usdt, daily_live_trade_count_max, min_calibrated_conviction, "
+            "max_live_exposure_usdt, max_us_equity_exposure_usd, "
+            "daily_live_trade_count_max, min_calibrated_conviction, "
             "min_closed_outcomes, allowed_sources, created_at, updated_at "
             "from live_autonomy_settings where actor = ?",
             (req.actor,),
@@ -2122,6 +2151,17 @@ def update_live_autonomy(req: LiveAutonomyUpdateRequest) -> JSONResponse | dict[
             if max_exposure > Decimal("100000"):
                 return JSONResponse(status_code=400, content={"code": "MAX_EXPOSURE_TOO_HIGH"})
             current["max_live_exposure_usdt"] = req.max_live_exposure_usdt
+        if req.max_us_equity_exposure_usd is not None:
+            max_stock_exposure = Decimal(req.max_us_equity_exposure_usd)
+            if max_stock_exposure < 0:
+                return JSONResponse(
+                    status_code=400, content={"code": "INVALID_MAX_US_EQUITY_EXPOSURE"}
+                )
+            if max_stock_exposure > Decimal("100000"):
+                return JSONResponse(
+                    status_code=400, content={"code": "MAX_US_EQUITY_EXPOSURE_TOO_HIGH"}
+                )
+            current["max_us_equity_exposure_usd"] = req.max_us_equity_exposure_usd
         if req.min_calibrated_conviction is not None:
             min_conv = Decimal(req.min_calibrated_conviction)
             if not (Decimal("0.5") <= min_conv <= Decimal("1.0")):
@@ -2145,14 +2185,16 @@ def update_live_autonomy(req: LiveAutonomyUpdateRequest) -> JSONResponse | dict[
             """
             insert into live_autonomy_settings
               (actor, enabled, daily_live_budget_usdt, per_live_trade_max_usdt,
-               max_live_exposure_usdt, daily_live_trade_count_max, min_calibrated_conviction,
+               max_live_exposure_usdt, max_us_equity_exposure_usd,
+               daily_live_trade_count_max, min_calibrated_conviction,
                min_closed_outcomes, allowed_sources, created_at, updated_at)
-            values (?,?,?,?,?,?,?,?,?,?,?)
+            values (?,?,?,?,?,?,?,?,?,?,?,?)
             on conflict(actor) do update set
               enabled = excluded.enabled,
               daily_live_budget_usdt = excluded.daily_live_budget_usdt,
               per_live_trade_max_usdt = excluded.per_live_trade_max_usdt,
               max_live_exposure_usdt = excluded.max_live_exposure_usdt,
+              max_us_equity_exposure_usd = excluded.max_us_equity_exposure_usd,
               daily_live_trade_count_max = excluded.daily_live_trade_count_max,
               min_calibrated_conviction = excluded.min_calibrated_conviction,
               min_closed_outcomes = excluded.min_closed_outcomes,
@@ -2165,6 +2207,7 @@ def update_live_autonomy(req: LiveAutonomyUpdateRequest) -> JSONResponse | dict[
                 current["daily_live_budget_usdt"],
                 current["per_live_trade_max_usdt"],
                 current["max_live_exposure_usdt"],
+                current["max_us_equity_exposure_usd"],
                 current["daily_live_trade_count_max"],
                 current["min_calibrated_conviction"],
                 current["min_closed_outcomes"],
@@ -2184,7 +2227,8 @@ def get_live_autonomy_settings(actor: str | None = None) -> JSONResponse | dict[
     with connect() as conn:
         row = conn.execute(
             "select enabled, daily_live_budget_usdt, per_live_trade_max_usdt, "
-            "max_live_exposure_usdt, daily_live_trade_count_max, min_calibrated_conviction, "
+            "max_live_exposure_usdt, max_us_equity_exposure_usd, "
+            "daily_live_trade_count_max, min_calibrated_conviction, "
             "min_closed_outcomes, allowed_sources, created_at, updated_at "
             "from live_autonomy_settings where actor = ?",
             (actor,),
@@ -2597,19 +2641,34 @@ def _outcome_row_to_dict(row: sqlite3.Row) -> dict[str, object]:
 
 
 @app.get("/pnl/today", response_model=None)
-def get_pnl_today(actor: str | None = None) -> JSONResponse | dict[str, object]:
+def get_pnl_today(
+    actor: str | None = None, venue: str | None = None
+) -> JSONResponse | dict[str, object]:
     if not actor:
         return JSONResponse(status_code=400, content={"code": "ACTOR_REQUIRED"})
+    if venue is not None and venue not in {"binance_spot", "ibkr_us_equity"}:
+        return JSONResponse(status_code=400, content={"code": "INVALID_VENUE"})
     today = _today()
     with connect() as conn:
-        rows = conn.execute(
-            "select symbol, realized_delta from daily_pnl where actor = ? and date = ?",
-            (actor, today),
-        ).fetchall()
-        position_rows = conn.execute(
-            "select symbol, qty, avg_cost from paper_positions where actor = ?",
-            (actor,),
-        ).fetchall()
+        if venue is None:
+            rows = conn.execute(
+                "select symbol, realized_delta from daily_pnl where actor = ? and date = ?",
+                (actor, today),
+            ).fetchall()
+            position_rows = conn.execute(
+                "select symbol, qty, avg_cost from paper_positions where actor = ?",
+                (actor,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "select symbol, realized_delta from daily_pnl "
+                "where actor = ? and date = ? and venue = ?",
+                (actor, today, venue),
+            ).fetchall()
+            position_rows = conn.execute(
+                "select symbol, qty, avg_cost from paper_positions where actor = ? and venue = ?",
+                (actor, venue),
+            ).fetchall()
 
     realized = Decimal("0")
     by_symbol_realized: dict[str, Decimal] = {}

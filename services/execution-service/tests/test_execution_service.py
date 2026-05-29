@@ -497,7 +497,7 @@ def test_ibkr_paper_rejects_live_without_broker_call(monkeypatch, tmp_path: Path
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "error"
-    assert "not yet available" in body["error"]
+    assert "requires bridge mode" in body["error"]
     assert seen_urls == []
 
 
@@ -644,6 +644,60 @@ def test_ibkr_bridge_pending_maps_to_open_after_poll_timeout(monkeypatch, tmp_pa
     assert response.status_code == 200
     assert response.json()["status"] == "open"
     assert response.json()["venue_order_id"] == "ibkr-123"
+
+
+def test_ibkr_bridge_live_blocked_without_service_gate(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(execution_app, "LIVE_TRADING_ENABLED", True)
+    monkeypatch.setattr(execution_app, "IBKR_LIVE_TRADING_ENABLED", False)
+    monkeypatch.setattr(execution_app, "IBKR_MODE", "bridge")
+
+    def fail_if_called(*args: object, **kwargs: object) -> None:
+        raise AssertionError("IBKR bridge must not be called while service gate is closed")
+
+    monkeypatch.setattr(execution_app.httpx, "post", fail_if_called)
+    response = TestClient(execution_app.app).post(
+        "/execute",
+        json=request_payload(),
+        headers=execution_headers(
+            **{"x-mode": "live", "x-venue": "ibkr_us_equity", "x-symbol": "NVDA"}
+        ),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "error"
+    assert body["error"] == "ibkr live trading not enabled in execution service"
+
+
+def test_ibkr_bridge_live_proceeds_when_service_gate_enabled(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(execution_app, "LIVE_TRADING_ENABLED", True)
+    monkeypatch.setattr(execution_app, "IBKR_LIVE_TRADING_ENABLED", True)
+    monkeypatch.setattr(execution_app, "IBKR_MODE", "bridge")
+    captured: dict[str, object] = {}
+
+    def fake_post(url: str, **kwargs: object) -> FakeIBKRBridgeResponse:
+        captured["url"] = url
+        return FakeIBKRBridgeResponse(bridge_order_payload("filled"))
+
+    monkeypatch.setattr(execution_app.httpx, "post", fake_post)
+    response = TestClient(execution_app.app).post(
+        "/execute",
+        json=request_payload(),
+        headers=execution_headers(
+            **{
+                "x-mode": "live",
+                "x-venue": "ibkr_us_equity",
+                "x-symbol": "NVDA",
+                "x-quantity": "2",
+            }
+        ),
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "filled"
+    assert captured["url"] == "http://ibkr-bridge:8086/orders"
 
 
 def test_ibkr_bridge_unreachable_returns_error(monkeypatch, tmp_path: Path) -> None:

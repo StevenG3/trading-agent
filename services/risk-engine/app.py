@@ -20,12 +20,15 @@ MAX_NOTIONAL_USDT = Decimal(os.getenv("MAX_NOTIONAL_USDT", "10000"))
 CONFIRMATION_THRESHOLD_USDT = Decimal(os.getenv("CONFIRMATION_THRESHOLD_USDT", "500"))
 PER_SYMBOL_DAILY_LIMIT_USDT = Decimal(os.getenv("PER_SYMBOL_DAILY_LIMIT_USDT", "50000"))
 LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true"
+IBKR_LIVE_TRADING_ENABLED = (
+    os.getenv("IBKR_LIVE_TRADING_ENABLED", "false").lower() == "true"
+)
 ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "http://orchestrator:8080")
 DAILY_DRAWDOWN_HARD_STOP_USDT = Decimal(
     os.getenv("DAILY_DRAWDOWN_HARD_STOP_USDT", "1000")
 )
 SUPPORTED_VENUES = {"binance_spot", "ibkr_us_equity"}
-LIVE_AVAILABLE_VENUES = {"binance_spot"}
+LIVE_AVAILABLE_VENUES = {"binance_spot", "ibkr_us_equity"}
 
 
 @app.exception_handler(RequestValidationError)
@@ -125,14 +128,11 @@ def evaluate(intent: OrderIntent) -> RiskDecision:
                 )
             )
             return _decision(intent, evaluated_at, False, reasons)
-        if intent.venue not in LIVE_AVAILABLE_VENUES:
+        if intent.venue == "ibkr_us_equity" and not IBKR_LIVE_TRADING_ENABLED:
             reasons.append(
                 RiskReason(
-                    code="LIVE_NOT_AVAILABLE_PHASE_21",
-                    detail=(
-                        f"live trading is not yet available for venue={intent.venue}; "
-                        "IBKR live trading remains gated until Phase 22 exposure caps"
-                    ),
+                    code="IBKR_LIVE_TRADING_DISABLED",
+                    detail="set IBKR_LIVE_TRADING_ENABLED=true to enable IBKR live trading",
                 )
             )
             return _decision(intent, evaluated_at, False, reasons)

@@ -21,6 +21,9 @@ from schemas import ExecutionRequest, ExecutionResult, Fill
 
 app = FastAPI(title="execution-service", version="0.1.0")
 LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true"
+IBKR_LIVE_TRADING_ENABLED = (
+    os.getenv("IBKR_LIVE_TRADING_ENABLED", "false").lower() == "true"
+)
 EXCHANGE_API_KEY = os.getenv("EXCHANGE_API_KEY", "")
 EXCHANGE_API_SECRET = os.getenv("EXCHANGE_API_SECRET", "")
 BINANCE_BASE_URL = "https://api.binance.com"
@@ -423,7 +426,12 @@ def _ibkr_bridge_execute(
     order_type: str,
     limit_price: str,
     time_in_force: str,
+    mode: str,
 ) -> ExecutionResult:
+    if mode == "live" and not IBKR_LIVE_TRADING_ENABLED:
+        result = _error_result(request, "ibkr live trading not enabled in execution service")
+        _persist_execution(request, result)
+        return result
     try:
         quantity = _ibkr_bridge_quantity(symbol, quantity_kind, base_qty, quote_qty)
         if quantity <= 0:
@@ -464,10 +472,6 @@ def _ibkr_execute(
     limit_price: str,
     time_in_force: str,
 ) -> ExecutionResult:
-    if mode == "live":
-        result = _error_result(request, "ibkr live trading not yet available")
-        _persist_execution(request, result)
-        return result
     if IBKR_MODE == "bridge":
         return _ibkr_bridge_execute(
             request,
@@ -479,7 +483,12 @@ def _ibkr_execute(
             order_type,
             limit_price,
             time_in_force,
+            mode,
         )
+    if mode == "live":
+        result = _error_result(request, "ibkr live trading requires bridge mode")
+        _persist_execution(request, result)
+        return result
     return _ibkr_paper_stub_execute(
         request, symbol, side, quantity_kind, base_qty, quote_qty, mode, market_url
     )
