@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "aegis"
+name = "aegis-exchange-bridge"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
@@ -11,6 +11,7 @@ dependencies = [
   "uvicorn[standard]>=0.29,<1",
   "pydantic>=2.7,<3",
   "httpx>=0.27,<1",
+  "ccxt>=4.4,<5",
 ]
 
 [project.optional-dependencies]
@@ -18,19 +19,12 @@ dev = [
   "pytest>=8,<9",
   "ruff>=0.5,<1",
   "mypy>=1.10,<2",
-  "ccxt>=4.4,<5",
+  "httpx>=0.27,<1",
 ]
-
-[tool.setuptools.packages.find]
-where = ["packages"]
-
-[tool.pytest.ini_options]
-pythonpath = ["packages"]
-testpaths = ["services", "packages/schemas/tests"]
 
 [tool.ruff]
 line-length = 100
-src = ["packages", "services"]
+src = ["."]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
@@ -38,5 +32,7 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
-mypy_path = ["packages", "services"]
-exclude = ["services/.*/tests"]
+exclude = ["tests"]
+
+[tool.setuptools]
+py-modules = ["app", "exchange_client"]
