@@ -32,6 +32,7 @@ services:
       NOTIFICATION_HOST_ALLOWLIST: ${NOTIFICATION_HOST_ALLOWLIST:-hermes-agent,hermes,localhost,127.0.0.1,172.17.0.1,172.23.0.1}
       IBKR_MODE: ${IBKR_MODE:-stub}
       IBKR_BRIDGE_URL: ${IBKR_BRIDGE_URL:-http://ibkr-bridge:8086}
+      EXCHANGE_BRIDGE_URL: ${EXCHANGE_BRIDGE_URL:-http://exchange-bridge:8087}
       IBKR_LIVE_TRADING_ENABLED: "false"
       RECONCILE_AVG_COST_TOLERANCE: "0.01"
       RECONCILE_APPLY_ENABLED: ${RECONCILE_APPLY_ENABLED:-false}
@@ -170,6 +171,28 @@ services:
     networks: [aegis_internal_net, host_access_net]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8086/healthz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  exchange-bridge:
+    build:
+      context: ..
+      dockerfile: services/exchange-bridge/Dockerfile
+    environment:
+      EXCHANGE_API_KEY: ${EXCHANGE_API_KEY:-}
+      EXCHANGE_API_SECRET: ${EXCHANGE_API_SECRET:-}
+      OKX_API_KEY: ${OKX_API_KEY:-}
+      OKX_API_SECRET: ${OKX_API_SECRET:-}
+      OKX_API_PASSPHRASE: ${OKX_API_PASSPHRASE:-}
+      BYBIT_API_KEY: ${BYBIT_API_KEY:-}
+      BYBIT_API_SECRET: ${BYBIT_API_SECRET:-}
+      EXCHANGE_TIMEOUT_SEC: ${EXCHANGE_TIMEOUT_SEC:-10}
+    ports:
+      - "127.0.0.1:${EXCHANGE_BRIDGE_HOST_PORT:-18087}:8087"
+    networks: [aegis_internal_net, host_access_net]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8087/healthz')"]
       interval: 10s
       timeout: 3s
       retries: 5
