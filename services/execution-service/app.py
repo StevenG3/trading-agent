@@ -718,6 +718,12 @@ def execute(
 ) -> ExecutionResult:
     if x_decision_approved.lower() != "true":
         raise HTTPException(status_code=403, detail={"code": "RISK_DECISION_NOT_APPROVED"})
+    if (
+        x_mode == "live"
+        and LIVE_TRADING_ENABLED
+        and not request.confirmation_token
+    ):
+        raise HTTPException(status_code=403, detail={"code": "CONFIRMATION_TOKEN_REQUIRED"})
 
     return _route_execution(
         request,

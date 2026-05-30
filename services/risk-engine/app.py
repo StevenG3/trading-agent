@@ -168,7 +168,9 @@ def evaluate(intent: OrderIntent) -> RiskDecision:
     if reasons:
         return _decision(intent, evaluated_at, False, reasons)
 
-    requires_confirmation = notional >= CONFIRMATION_THRESHOLD_USDT
+    requires_confirmation = (
+        intent.mode == "live" or notional >= CONFIRMATION_THRESHOLD_USDT
+    )
     token = str(uuid4()) if requires_confirmation else None
     expires_at = evaluated_at + timedelta(minutes=5) if requires_confirmation else None
     return _decision(
