@@ -163,6 +163,8 @@ def test_live_enabled_market_order_proceeds_to_notional_check(monkeypatch) -> No
     assert response.status_code == 200
     body = response.json()
     assert body["approved"] is True
+    assert body["requires_confirmation"] is True
+    UUID(body["confirmation_token"])
     assert not any(reason["code"] == "LIVE_TRADING_DISABLED" for reason in body["reasons"])
 
 
@@ -207,6 +209,8 @@ def test_live_enabled_limit_order_with_price_approved(monkeypatch) -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["approved"] is True
+    assert body["requires_confirmation"] is True
+    UUID(body["confirmation_token"])
     assert not any(r["code"] == "LIMIT_ORDER_LIVE_UNSUPPORTED" for r in body["reasons"])
 
 
@@ -224,7 +228,10 @@ def test_live_enabled_base_order_calls_market_data(monkeypatch) -> None:
     payload = dict(VALID, mode="live", quantity={"kind": "base", "value": "0.001"})
     response = TestClient(app).post("/validate", json=payload)
     assert response.status_code == 200
-    assert response.json()["approved"] is True
+    body = response.json()
+    assert body["approved"] is True
+    assert body["requires_confirmation"] is True
+    UUID(body["confirmation_token"])
     assert called["count"] == 2
 
 
@@ -270,6 +277,8 @@ def test_risk_accepts_ibkr_live_when_global_and_venue_enabled(monkeypatch) -> No
     assert response.status_code == 200
     body = response.json()
     assert body["approved"] is True
+    assert body["requires_confirmation"] is True
+    UUID(body["confirmation_token"])
     assert not any(reason["code"] == "LIVE_NOT_AVAILABLE_PHASE_21" for reason in body["reasons"])
 
 

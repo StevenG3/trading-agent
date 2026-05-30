@@ -22,13 +22,16 @@ def load_service_app(name: str):
 execution_app = load_service_app("execution_service_app")
 
 
-def request_payload(idempotency_key: str = "demo-paper-1") -> dict[str, str | bool | None]:
+def request_payload(
+    idempotency_key: str = "demo-paper-1",
+    confirmation_token: str | None = "confirmed-token",
+) -> dict[str, str | bool | None]:
     return {
         "execution_id": str(uuid4()),
         "intent_id": "11111111-1111-4111-8111-111111111111",
         "decision_id": "33333333-3333-4333-8333-333333333333",
         "idempotency_key": idempotency_key,
-        "confirmation_token": None,
+        "confirmation_token": confirmation_token,
         "dry_run": False,
         "submitted_at": "2026-05-25T00:00:00Z",
     }
@@ -113,6 +116,17 @@ def test_live_mode_rejected_when_disabled(monkeypatch) -> None:
     )
     assert response.status_code == 403
     assert response.json()["detail"]["code"] == "LIVE_TRADING_DISABLED"
+
+
+def test_live_mode_requires_confirmation_token_when_enabled(monkeypatch) -> None:
+    enable_live(monkeypatch)
+    response = TestClient(execution_app.app).post(
+        "/execute",
+        json=request_payload(confirmation_token=None),
+        headers=execution_headers(**{"x-mode": "live"}),
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "CONFIRMATION_TOKEN_REQUIRED"
 
 
 def test_paper_execute_returns_simulated_result(monkeypatch, tmp_path: Path) -> None:
